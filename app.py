@@ -39,12 +39,31 @@ st.markdown(
             border-radius: 12px;
             padding: 12px;
             background: #FFFFFF;
+            color: #1a1a1a;
+        }}
+        div[data-testid="stMetric"] label,
+        div[data-testid="stMetric"] [data-testid="stMetricLabel"] {{
+            color: #555555;
+        }}
+        div[data-testid="stMetric"] [data-testid="stMetricValue"] {{
+            color: #1a1a1a;
+        }}
+        div[data-testid="stMetric"] [data-testid="stMetricDelta"] {{
+            color: #333333;
         }}
         .app-note {{
             padding: 12px 14px;
             background: #EAF8F8;
             border-left: 5px solid {PRIMARY};
             border-radius: 8px;
+            color: #1a1a1a;
+        }}
+        .stSidebar .stMetric label,
+        .stSidebar .stMetric div {{
+            color: #1a1a1a !important;
+        }}
+        .stSidebar .stMetric {{
+            color: #1a1a1a !important;
         }}
     </style>
     """,
