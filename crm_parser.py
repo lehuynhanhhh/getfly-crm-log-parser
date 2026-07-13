@@ -458,7 +458,7 @@ def _nearest_amount(
     if prefer_after and after:
         return min(after, key=lambda item: item["start"] - keyword_match.end())
     if before:
-        return min(before, key=lambda item: keyword_match.start() - item["end"])
+        return max(before, key=lambda item: item["value"])
     if after:
         return min(after, key=lambda item: item["start"] - keyword_match.end())
     return amounts[0]
@@ -811,7 +811,7 @@ def _extract_financial_events_for_log(
                 search_tail = normalized[purchase_match.end():]
                 target_rel = (
                     re.search(r"\bTONG\b", search_tail)
-                    or re.search(r"=", search_tail)
+                    or re.search(r"(?<!<)=(?!>)", search_tail)
                     or re.search(r"\bGIA\b", search_tail)
                     or re.search(r"\bCON\b", search_tail)
                 )
@@ -821,7 +821,7 @@ def _extract_financial_events_for_log(
                         item for item in amounts_after_purchase
                         if item["start"] >= target_position
                     ]
-                    amount_item = after_target[0] if after_target else amounts_after_purchase[-1]
+                    amount_item = after_target[0] if after_target else amounts_after_purchase[0]
                 else:
                     amount_item = amounts_after_purchase[0]
             if amount_item:
