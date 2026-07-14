@@ -1151,10 +1151,15 @@ def _extract_inventory_for_log(
         )
         # Line with HS code AND quantity unit (even without "CÒN" keyword)
         has_hs_with_quantity = bool(profile_codes) and has_quantity_unit and not has_con_keyword
+        # Bare quantity line (e.g., "1L XNMCB") — starts with number+unit, no header keywords
+        is_bare_quantity = bool(
+            re.match(r"^\s*\d+(?:[.,]\d+)?\s*(?:B|L|CC|MG|THÁNG|THANG|THẺ|THE|MŨI|MUI)\s+", normalized)
+        ) and not any(x in normalized for x in ("TRU ", "SD ", "HET ", "TANG")) and not CUSTOMER_CODE_RE.search(line)
         has_inventory_language = (
             (has_con_keyword and (bool(profile_codes) or has_quantity_unit))
             or is_sub_item
             or has_hs_with_quantity
+            or is_bare_quantity
         )
         if not has_inventory_language:
             continue
@@ -1163,7 +1168,7 @@ def _extract_inventory_for_log(
         sub_lines = re.split(r"\s+\+\s+", line.strip(" *-"))
         all_profile = "; ".join(dict.fromkeys(profile_codes))
         common_status = _inventory_status(normalized)
-        if not common_status and (is_sub_item or has_hs_with_quantity):
+        if not common_status and (is_sub_item or has_hs_with_quantity or is_bare_quantity):
             common_status = "Còn"
 
         for seg_idx, seg in enumerate(sub_lines):
