@@ -206,28 +206,42 @@ def latest_balance(financial: pd.DataFrame, event_type: str) -> float | None:
     return float(latest.iloc[-1]["Số tiền (VND)"])
 
 
+def _is_num_clean(series: pd.Series) -> tuple[bool, pd.Series]:
+    if pd.api.types.is_bool_dtype(series.dtype):
+        return False, series
+    if pd.api.types.is_numeric_dtype(series.dtype):
+        return True, series
+    if pd.api.types.is_datetime64_any_dtype(series.dtype):
+        return False, series
+    cleaned = series.astype(str).str.replace(r"\.(?=\d{3})", "", regex=True)
+    cleaned = cleaned.str.replace(",", ".").str.replace(r"[^\d.]", "", regex=True)
+    coerced = pd.to_numeric(cleaned, errors="coerce").dropna()
+    return len(coerced) > 0, coerced
+
+
 def _column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
     if df.empty:
         return df
     clear_key = st.session_state.get(f"flt_clear_{key_prefix}", 0)
+    skip_cols = {"Chọn", "Getfly URL"}
     filters = {}
     with st.expander("🔍 Lọc theo cột", expanded=False):
         cols = st.columns(min(4, len(df.columns)))
         for i, col in enumerate(df.columns):
+            if col in skip_cols:
+                continue
             with cols[i % len(cols)]:
                 raw = df[col].dropna()
                 if raw.empty:
                     continue
-                if pd.api.types.is_numeric_dtype(raw.dtype):
-                    coerced = raw
-                    is_num = True
-                else:
-                    coerced = pd.to_numeric(raw, errors="coerce").dropna()
-                    is_num = len(coerced) > 0
+                if pd.api.types.is_datetime64_any_dtype(raw.dtype):
+                    st.text(f"📅 {col}")
+                    continue
+                is_num, coerced = _is_num_clean(raw)
                 if is_num:
                     lo, hi = float(coerced.min()), float(coerced.max())
                     if lo == hi:
-                        st.text(f"{col}: {lo:.0f}")
+                        st.text(f"{col}: {lo:,.0f}")
                         continue
                     filters[col] = st.slider(
                         col, lo, hi, (lo, hi),
@@ -249,13 +263,19 @@ def _column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
     for col, fval in filters.items():
         if fval is None:
             continue
-        if pd.api.types.is_numeric_dtype(df[col].dtype):
+        is_num, _ = _is_num_clean(df[col])
+        if is_num:
             if isinstance(fval, (list, tuple)) and len(fval) == 2:
                 lo, hi = fval
-                df = df[df[col].between(lo, hi, inclusive="both")]
+                if pd.api.types.is_numeric_dtype(df[col].dtype):
+                    df = df[df[col].between(lo, hi, inclusive="both")]
+                else:
+                    _, coerced = _is_num_clean(df[col])
+                    mask = coerced.between(lo, hi, inclusive="both")
+                    df = df[mask.reindex(df.index, fill_value=False)]
         else:
             df = df[df[col].astype(str) == fval]
-    return df
+    return df.reset_index(drop=True)
 
 
 st.title("Getfly CRM Log")
