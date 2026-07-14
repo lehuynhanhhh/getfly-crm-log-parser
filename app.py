@@ -16,7 +16,9 @@ from database import (
     load_inventory,
     load_logs,
     load_mentions,
+    register_user,
     save_bundle,
+    verify_user,
 )
 from excel_export import build_excel_bytes
 
@@ -71,6 +73,58 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# ── Auth ──
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title("🔐 Đăng nhập")
+    login_tab, register_tab = st.tabs(["Đăng nhập", "Đăng ký"])
+
+    with login_tab:
+        with st.form("login_form"):
+            login_email = st.text_input(
+                "Email (@driphydration.vn)",
+                placeholder="username@driphydration.vn",
+            ).strip().lower()
+            login_pw = st.text_input("Password", type="password")
+            if st.form_submit_button("Đăng nhập", type="primary", use_container_width=True):
+                if not login_email.endswith("@driphydration.vn"):
+                    st.error("Email phải có đuôi @driphydration.vn")
+                elif verify_user(login_email, login_pw):
+                    st.session_state.authenticated = True
+                    st.session_state.user_email = login_email
+                    st.rerun()
+                else:
+                    st.error("Sai email hoặc mật khẩu")
+
+    with register_tab:
+        with st.form("register_form"):
+            reg_email = st.text_input(
+                "Email (@driphydration.vn)",
+                placeholder="username@driphydration.vn",
+            ).strip().lower()
+            reg_pw = st.text_input("Password", type="password")
+            reg_confirm = st.text_input("Xác nhận password", type="password")
+            if st.form_submit_button("Đăng ký", use_container_width=True):
+                if not reg_email.endswith("@driphydration.vn"):
+                    st.error("Email phải có đuôi @driphydration.vn")
+                elif len(reg_pw) < 4:
+                    st.error("Password phải có ít nhất 4 ký tự")
+                elif reg_pw != reg_confirm:
+                    st.error("Mật khẩu xác nhận không khớp")
+                elif register_user(reg_email, reg_pw):
+                    st.success("Đăng ký thành công! Chuyển sang tab Đăng nhập.")
+                else:
+                    st.error("Email này đã tồn tại")
+
+    st.stop()
+
+st.sidebar.markdown(f"👤 **{st.session_state.user_email}**")
+if st.sidebar.button("🚪 Đăng xuất"):
+    st.session_state.authenticated = False
+    st.rerun()
 
 init_db()
 

@@ -67,6 +67,11 @@ CREATE INDEX IF NOT EXISTS idx_crm_logs_v2_customer ON crm_logs_v2(customer_code
 CREATE INDEX IF NOT EXISTS idx_financial_customer ON financial_events(customer_code);
 CREATE INDEX IF NOT EXISTS idx_inventory_customer ON service_inventory(customer_code);
 CREATE INDEX IF NOT EXISTS idx_mentions_customer ON customer_mentions(customer_code);
+CREATE TABLE IF NOT EXISTS users (
+    email TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -447,3 +452,33 @@ def database_stats(db_path: Path = DB_PATH) -> tuple[int, int, int, int]:
         financial = _execute(conn, "SELECT COUNT(*) FROM financial_events").fetchone()[0]
         inventory = _execute(conn, "SELECT COUNT(*) FROM service_inventory").fetchone()[0]
     return int(customers), int(logs), int(financial), int(inventory)
+
+
+def register_user(email: str, password: str, db_path: Path = DB_PATH) -> bool:
+    import bcrypt
+    init_db(db_path)
+    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    with _connect(db_path) as conn:
+        try:
+            _execute(
+                conn,
+                "INSERT INTO users (email, password_hash) VALUES (?, ?)",
+                (email, password_hash),
+            )
+            return True
+        except Exception:
+            return False
+
+
+def verify_user(email: str, password: str, db_path: Path = DB_PATH) -> bool:
+    import bcrypt
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = _execute(
+            conn,
+            "SELECT password_hash FROM users WHERE email = ?",
+            (email,),
+        ).fetchone()
+    if row is None:
+        return False
+    return bcrypt.checkpw(password.encode(), row[0].encode())

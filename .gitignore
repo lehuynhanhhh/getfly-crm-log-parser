@@ -1,3 +1,6 @@
+# Streamlit secrets (local)
+.streamlit/secrets.toml
+
 # Database
 data/
 
