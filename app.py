@@ -196,7 +196,7 @@ def _column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
                     sel = st.selectbox(
                         col,
                         ["", *options],
-                        format_func=lambda x: x if x else "Tất cả",
+                        format_func=lambda x: "Tất cả" if x == "" else str(x),
                         key=f"flt_{key_prefix}_{i}_{clear_key}",
                     )
                     if sel:
