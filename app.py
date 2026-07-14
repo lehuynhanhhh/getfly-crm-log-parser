@@ -173,35 +173,32 @@ def latest_balance(financial: pd.DataFrame, event_type: str) -> float | None:
 def _column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
     if df.empty:
         return df
+    clear_key = st.session_state.get(f"flt_clear_{key_prefix}", 0)
+    filters = {}
     with st.expander("🔍 Lọc theo cột", expanded=False):
-        filters = {}
         cols = st.columns(min(4, len(df.columns)))
         for i, col in enumerate(df.columns):
             with cols[i % len(cols)]:
                 series = df[col].dropna()
                 if series.empty:
                     continue
-                dtype = series.dtype
-                if pd.api.types.is_numeric_dtype(dtype):
-                    min_v, max_v = float(series.min()), float(series.max())
-                    if min_v == max_v:
-                        st.text(f"{col}: {min_v:.0f}")
+                if pd.api.types.is_numeric_dtype(series.dtype):
+                    lo, hi = float(series.min()), float(series.max())
+                    if lo == hi:
+                        st.text(f"{col}: {lo:.0f}")
                         continue
                     filters[col] = st.slider(
-                        col, min_v, max_v, (min_v, max_v),
-                        key=f"flt_{key_prefix}_{i}",
-                    )
-                elif series.nunique() <= 20:
-                    options = sorted(series.unique().tolist())
-                    filters[col] = st.multiselect(
-                        col, options, default=options,
-                        key=f"flt_{key_prefix}_{i}",
+                        col, lo, hi, (lo, hi),
+                        key=f"flt_{key_prefix}_{i}_{clear_key}",
                     )
                 else:
                     filters[col] = st.text_input(
                         col, "",
-                        key=f"flt_{key_prefix}_{i}",
+                        key=f"flt_{key_prefix}_{i}_{clear_key}",
                     ).strip().lower()
+        if st.button("🗑️ Xoá bộ lọc", key=f"flt_btn_{key_prefix}_{clear_key}"):
+            st.session_state[f"flt_clear_{key_prefix}"] = clear_key + 1
+            st.rerun()
     for col, fval in filters.items():
         if fval is None:
             continue
@@ -210,9 +207,6 @@ def _column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
             if isinstance(fval, (list, tuple)) and len(fval) == 2:
                 lo, hi = fval
                 df = df[df[col].between(lo, hi, inclusive="both")]
-        elif isinstance(fval, list):
-            if fval:
-                df = df[df[col].isin(fval)]
         elif fval:
             df = df[df[col].astype(str).str.lower().str.contains(fval, na=False)]
     return df
