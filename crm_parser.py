@@ -752,8 +752,10 @@ def _extract_financial_events_for_log(
         rate = rate_match.group(0) if rate_match else ""
 
         # Balance snapshots
-        if "COC CON" in normalized:
-            keyword = re.search(r"COC\s+CON", normalized)
+        # Deposit / cọc (with or without "CÒN" keyword)
+        coc_match = re.search(r"\bCOC\b", normalized)
+        if "COC CON" in normalized or (coc_match and re.search(r":\s*\d", line)):
+            keyword = re.search(r"COC\s+CON", normalized) if "COC CON" in normalized else None
             add_event(
                 line, "Số dư cọc", "Số dư nghĩa vụ với khách hàng",
                 _nearest_amount(line, keyword), "Cọc", payment_status,
@@ -761,35 +763,40 @@ def _extract_financial_events_for_log(
             )
             continue
 
-        if (
-            re.match(r"^\s*(?:TK|THE\s+TK|THE\s+TAI\s+KHOAN|THE\s+TON|TONG\s+TK\s+TANG)\b", normalized)
-            and "CON" in normalized
-            and not re.search(r"\b(?:B|L|CC|MG|THANG)\b", normalized)
-        ):
-            keyword = re.search(r"\bCON\b", normalized)
-            if "TANG" in normalized:
-                event_type = "Số dư tài khoản tặng"
-                perspective = "Số dư quyền lợi khách hàng"
-                account = "Tài khoản tặng"
-            elif "VOUCHER" in normalized or re.search(r"\bVC\b", normalized):
-                event_type = "Số dư voucher"
-                perspective = "Số dư quyền lợi khách hàng"
-                account = "Voucher"
-            else:
-                event_type = "Số dư tài khoản chính"
-                perspective = "Số dư quyền lợi khách hàng"
-                account = "Tài khoản chính"
-                account_name_match = re.search(r"TK\s+([A-Z0-9 ._-]+?)\s+CON", normalized)
-                if account_name_match:
-                    account_name = account_name_match.group(1).strip()
-                    if account_name and account_name not in {"CHINH"}:
-                        account = f"Tài khoản {account_name.title()}"
-            add_event(
-                line, event_type, perspective,
-                _nearest_amount(line, keyword), account, payment_status,
-                service_user, funding_owner, expiry, rate,
-            )
-            continue
+        # Account balances (TK, THE TK, PREPAID, ... with or without "CÒN")
+        account_keyword_match = re.match(
+            r"^\s*(?:TK|THE\s+TK|THE\s+TAI\s+KHOAN|THE\s+TON|TONG\s+TK\s+TANG|PREPAID|PREPAY)\b",
+            normalized,
+        )
+        if account_keyword_match and not re.search(r"\b(?:B|L|CC|MG|THANG)\b", normalized):
+            has_con = "CON" in normalized
+            has_colon_amount = bool(re.search(r":\s*\d+", line))
+            if has_con or has_colon_amount:
+                keyword = re.search(r"\bCON\b", normalized) if has_con else None
+                if "TANG" in normalized:
+                    event_type = "Số dư tài khoản tặng"
+                    perspective = "Số dư quyền lợi khách hàng"
+                    account = "Tài khoản tặng"
+                elif "VOUCHER" in normalized or re.search(r"\bVC\b", normalized):
+                    event_type = "Số dư voucher"
+                    perspective = "Số dư quyền lợi khách hàng"
+                    account = "Voucher"
+                else:
+                    event_type = "Số dư tài khoản chính"
+                    perspective = "Số dư quyền lợi khách hàng"
+                    account = "Tài khoản chính"
+                    if has_con:
+                        account_name_match = re.search(r"TK\s+([A-Z0-9 ._-]+?)\s+CON", normalized)
+                        if account_name_match:
+                            account_name = account_name_match.group(1).strip()
+                            if account_name and account_name not in {"CHINH"}:
+                                account = f"Tài khoản {account_name.title()}"
+                add_event(
+                    line, event_type, perspective,
+                    _nearest_amount(line, keyword), account, payment_status,
+                    service_user, funding_owner, expiry, rate,
+                )
+                continue
 
         if "CON TONG VC" in normalized or ("VOUCHER" in normalized and "CON" in normalized):
             keyword = re.search(r"(?:CON\s+TONG\s+VC|VOUCHER.*?CON)", normalized)
@@ -1095,6 +1102,7 @@ def _clean_inventory_service(line: str) -> str:
     text = re.sub(r"^\d+\s*(?:B|L|CC|MG|THÁNG|THANG|THẺ|THE|MŨI|MUI)\s+", "", text, flags=re.IGNORECASE)
     qty_unit = r"(?:B|L|CC|MG|THÁNG|THANG|THẺ|THE|MŨI|MUI)"
     text = re.sub(rf"\s+\d+\s*{qty_unit}\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*\(\s*\)", "", text)
     text = re.sub(r"\s+", " ", text).strip(" -:")
     return text
 
@@ -1116,9 +1124,12 @@ def _extract_inventory_for_log(
             current_service_user = pairs[0]
 
         # Skip financial balances.
+        has_coc = bool(re.search(r"\bCOC\b", normalized))
+        has_tk_con = (("TK" in normalized or "THE TK" in normalized) and "CON" in normalized)
         if (
             "COC CON" in normalized
-            or (("TK" in normalized or "THE TK" in normalized) and "CON" in normalized)
+            or (has_coc and re.search(r":\s*\d+", line))
+            or has_tk_con
             or "CON TONG VC" in normalized
         ):
             continue
@@ -1130,49 +1141,77 @@ def _extract_inventory_for_log(
             for keyword in ("CON ", "CON:", "CON SAN", "CHUA SD", "CHUA SU DUNG", "CO ")
         )
         # Sub-item: line starts with - or * bullet and has quantity+unit
-        is_sub_item = bool(re.match(r"\s*[*\-]\s+", line)) and has_quantity_unit and not profile_codes
+        # but NOT a usage line (has "SD" keyword or customer codes)
+        is_sub_item = (
+            bool(re.match(r"\s*[*\-]\s+", line))
+            and has_quantity_unit
+            and not profile_codes
+            and not re.search(r"\bSD\b", normalized)
+            and not CUSTOMER_CODE_RE.search(line)
+        )
+        # Line with HS code AND quantity unit (even without "CÒN" keyword)
+        has_hs_with_quantity = bool(profile_codes) and has_quantity_unit and not has_con_keyword
         has_inventory_language = (
             (has_con_keyword and (bool(profile_codes) or has_quantity_unit))
             or is_sub_item
+            or has_hs_with_quantity
         )
         if not has_inventory_language:
             continue
 
-        quantity, unit, quantity_detail = _extract_quantity_details(line)
-        status = _inventory_status(normalized)
-        if not status and is_sub_item:
-            status = "Còn"
-        service = _clean_inventory_service(line)
-        owner = (primary_code, primary_name)
-        event_id = _make_event_id("INV", log_key, line, status, quantity_detail)
+        # Split multi-service lines on " + " separator
+        sub_lines = re.split(r"\s+\+\s+", line.strip(" *-"))
+        all_profile = "; ".join(dict.fromkeys(profile_codes))
+        common_status = _inventory_status(normalized)
+        if not common_status and (is_sub_item or has_hs_with_quantity):
+            common_status = "Còn"
 
-        rows.append(
-            {
-                "Inventory event ID": event_id,
-                "Log key": log_key,
-                "Mã KH chính": primary_code,
-                "Tên khách hàng chính": primary_name,
-                "Thời gian ghi nhận": log["log_datetime"],
-                "Mã KH sở hữu": owner[0],
-                "Tên KH sở hữu": owner[1],
-                "Mã KH sử dụng dịch vụ": current_service_user[0] if current_service_user else "",
-                "Tên KH sử dụng dịch vụ": current_service_user[1] if current_service_user else "",
-                "Trạng thái tồn": status,
-                "Dịch vụ/Gói còn lại": service,
-                "Số lượng chính": quantity,
-                "Đơn vị chính": unit,
-                "Chi tiết số lượng": quantity_detail,
-                "Là quà tặng": "Có" if (
-                    re.search(r"\bTẶNG\b", line, re.IGNORECASE)
-                    or ("TANG" in normalized and "TANG CUONG" not in normalized)
-                ) else "Không",
-                "Ngày kích hoạt": _extract_activation(line),
-                "Hạn sử dụng": _extract_expiry(line),
-                "Mã hồ sơ HS": "; ".join(dict.fromkeys(profile_codes)),
-                "Dòng nguồn": line,
-                "Độ tin cậy": "Cao" if profile_codes or quantity_detail else "Trung bình",
-            }
-        )
+        for seg_idx, seg in enumerate(sub_lines):
+            seg = seg.strip()
+            if not seg:
+                continue
+            seg_normalized = strip_accents(seg).upper()
+            seg_has_quantity = bool(
+                re.search(r"\d+\s*(?:B|L|CC|MG|THANG|THE|MUI)\b", seg_normalized)
+            )
+            # Only create a row if this segment has quantity+unit or it's the only segment
+            if len(sub_lines) > 1 and not seg_has_quantity:
+                continue
+
+            quantity, unit, quantity_detail = _extract_quantity_details(seg)
+            seg_profile = [m.group().upper() for m in PROFILE_CODE_RE.finditer(seg)]
+            seg_service = _clean_inventory_service(seg)
+            owner = (primary_code, primary_name)
+            seg_hs = all_profile if not seg_profile else "; ".join(dict.fromkeys(seg_profile))
+            event_id = _make_event_id("INV", log_key, seg, common_status, quantity_detail)
+
+            rows.append(
+                {
+                    "Inventory event ID": event_id,
+                    "Log key": log_key,
+                    "Mã KH chính": primary_code,
+                    "Tên khách hàng chính": primary_name,
+                    "Thời gian ghi nhận": log["log_datetime"],
+                    "Mã KH sở hữu": owner[0],
+                    "Tên KH sở hữu": owner[1],
+                    "Mã KH sử dụng dịch vụ": current_service_user[0] if current_service_user else "",
+                    "Tên KH sử dụng dịch vụ": current_service_user[1] if current_service_user else "",
+                    "Trạng thái tồn": common_status,
+                    "Dịch vụ/Gói còn lại": seg_service,
+                    "Số lượng chính": quantity,
+                    "Đơn vị chính": unit,
+                    "Chi tiết số lượng": quantity_detail,
+                    "Là quà tặng": "Có" if (
+                        re.search(r"\bTẶNG\b", line, re.IGNORECASE)
+                        or ("TANG" in normalized and "TANG CUONG" not in normalized)
+                    ) else "Không",
+                    "Ngày kích hoạt": _extract_activation(seg),
+                    "Hạn sử dụng": _extract_expiry(seg),
+                    "Mã hồ sơ HS": seg_hs,
+                    "Dòng nguồn": seg,
+                    "Độ tin cậy": "Cao" if (seg_profile or all_profile or quantity_detail) else "Trung bình",
+                }
+            )
 
     return rows
 
