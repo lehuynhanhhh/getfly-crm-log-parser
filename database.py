@@ -70,6 +70,7 @@ CREATE INDEX IF NOT EXISTS idx_mentions_customer ON customer_mentions(customer_c
 CREATE TABLE IF NOT EXISTS users (
     email TEXT PRIMARY KEY,
     password_hash TEXT NOT NULL,
+    role TEXT DEFAULT 'user',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 """
@@ -130,6 +131,30 @@ def _init_schema(conn) -> None:
 def init_db(db_path: Path = DB_PATH) -> None:
     with _connect(db_path) as conn:
         _init_schema(conn)
+        _migrate_users(conn)
+    seed_admin(db_path)
+
+
+def _migrate_users(conn) -> None:
+    cols = _table_columns(conn, "users")
+    if "role" not in cols:
+        _execute(conn, "ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'")
+
+
+def seed_admin(db_path: Path = DB_PATH) -> None:
+    import bcrypt
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        exists = _execute(
+            conn, "SELECT 1 FROM users WHERE email = ?", ("admin@driphydration.vn",)
+        ).fetchone()
+        if not exists:
+            pw_hash = bcrypt.hashpw(b"Financeteam@123", bcrypt.gensalt()).decode()
+            _execute(
+                conn,
+                "INSERT INTO users (email, password_hash, role) VALUES (?, ?, ?)",
+                ("admin@driphydration.vn", pw_hash, "admin"),
+            )
 
 
 def _json_value(value: Any) -> Any:
@@ -454,7 +479,9 @@ def database_stats(db_path: Path = DB_PATH) -> tuple[int, int, int, int]:
     return int(customers), int(logs), int(financial), int(inventory)
 
 
-def register_user(email: str, password: str, db_path: Path = DB_PATH) -> bool:
+def register_user(
+    email: str, password: str, role: str = "user", db_path: Path = DB_PATH,
+) -> bool:
     import bcrypt
     init_db(db_path)
     password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
@@ -462,23 +489,24 @@ def register_user(email: str, password: str, db_path: Path = DB_PATH) -> bool:
         try:
             _execute(
                 conn,
-                "INSERT INTO users (email, password_hash) VALUES (?, ?)",
-                (email, password_hash),
+                "INSERT INTO users (email, password_hash, role) VALUES (?, ?, ?)",
+                (email, password_hash, role),
             )
             return True
         except Exception:
             return False
 
 
-def verify_user(email: str, password: str, db_path: Path = DB_PATH) -> bool:
+def verify_user(email: str, password: str, db_path: Path = DB_PATH) -> tuple[bool, str]:
     import bcrypt
     init_db(db_path)
     with _connect(db_path) as conn:
         row = _execute(
             conn,
-            "SELECT password_hash FROM users WHERE email = ?",
+            "SELECT password_hash, role FROM users WHERE email = ?",
             (email,),
         ).fetchone()
     if row is None:
-        return False
-    return bcrypt.checkpw(password.encode(), row[0].encode())
+        return False, ""
+    ok = bcrypt.checkpw(password.encode(), row[0].encode())
+    return ok, (row[1] if ok else "")

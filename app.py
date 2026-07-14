@@ -18,6 +18,7 @@ from database import (
     load_mentions,
     register_user,
     save_bundle,
+    seed_admin,
     verify_user,
 )
 from excel_export import build_excel_bytes
@@ -92,12 +93,15 @@ if not st.session_state.authenticated:
             if st.form_submit_button("Đăng nhập", type="primary", use_container_width=True):
                 if not login_email.endswith("@driphydration.vn"):
                     st.error("Email phải có đuôi @driphydration.vn")
-                elif verify_user(login_email, login_pw):
-                    st.session_state.authenticated = True
-                    st.session_state.user_email = login_email
-                    st.rerun()
                 else:
-                    st.error("Sai email hoặc mật khẩu")
+                    ok, role = verify_user(login_email, login_pw)
+                    if ok:
+                        st.session_state.authenticated = True
+                        st.session_state.user_email = login_email
+                        st.session_state.user_role = role
+                        st.rerun()
+                    else:
+                        st.error("Sai email hoặc mật khẩu")
 
     with register_tab:
         with st.form("register_form"):
@@ -121,7 +125,8 @@ if not st.session_state.authenticated:
 
     st.stop()
 
-st.sidebar.markdown(f"👤 **{st.session_state.user_email}**")
+role_badge = "🛡️ admin" if st.session_state.user_role == "admin" else "👤 user"
+st.sidebar.markdown(f"👤 **{st.session_state.user_email}** · {role_badge}")
 if st.sidebar.button("🚪 Đăng xuất"):
     st.session_state.authenticated = False
     st.rerun()
@@ -469,29 +474,36 @@ with tab_history:
     ]
 
     st.markdown("---")
+    is_admin = st.session_state.get("user_role") == "admin"
     col_delete_sel, col_delete_all, _ = st.columns([1, 1, 2])
     with col_delete_sel:
         if st.button("Xoá dòng đã chọn", type="secondary", use_container_width=True):
-            selected_by_tab = st.session_state.get("history_checked_rows", {})
-            all_keys = []
-            for tab_idx, frame in enumerate(history_frames):
-                tab_selected = selected_by_tab.get(tab_idx, set())
-                if tab_selected and not frame.empty:
-                    id_col = ["Log key", "Log key", "Log key", "Log key"][tab_idx]
-                    if id_col in frame.columns:
-                        for row_idx in tab_selected:
-                            if row_idx < len(frame):
-                                all_keys.append(str(frame.iloc[row_idx].get(id_col, "")))
-            deleted = delete_logs([k for k in all_keys if k])
-            if deleted:
-                st.success(f"Đã xoá {deleted} log và dữ liệu liên quan.")
-                st.session_state["history_refresh"] = refresh_key + 1
-                st.rerun()
+            if not is_admin:
+                st.warning("Bạn không có quyền xoá dữ liệu.")
             else:
-                st.warning("Không có dòng nào được chọn hoặc log key không hợp lệ.")
+                selected_by_tab = st.session_state.get("history_checked_rows", {})
+                all_keys = []
+                for tab_idx, frame in enumerate(history_frames):
+                    tab_selected = selected_by_tab.get(tab_idx, set())
+                    if tab_selected and not frame.empty:
+                        id_col = ["Log key", "Log key", "Log key", "Log key"][tab_idx]
+                        if id_col in frame.columns:
+                            for row_idx in tab_selected:
+                                if row_idx < len(frame):
+                                    all_keys.append(str(frame.iloc[row_idx].get(id_col, "")))
+                deleted = delete_logs([k for k in all_keys if k])
+                if deleted:
+                    st.success(f"Đã xoá {deleted} log và dữ liệu liên quan.")
+                    st.session_state["history_refresh"] = refresh_key + 1
+                    st.rerun()
+                else:
+                    st.warning("Không có dòng nào được chọn hoặc log key không hợp lệ.")
     with col_delete_all:
         if st.button("Xoá toàn bộ database", type="secondary", use_container_width=True):
-            st.session_state["confirm_delete_all"] = True
+            if not is_admin:
+                st.warning("Bạn không có quyền xoá dữ liệu.")
+            else:
+                st.session_state["confirm_delete_all"] = True
 
     if st.session_state.get("confirm_delete_all"):
         st.warning("Bạn có chắc chắn muốn xoá TOÀN BỘ dữ liệu? Hành động này không thể hoàn tác.")
