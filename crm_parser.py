@@ -1028,12 +1028,33 @@ def _inventory_status(normalized: str) -> str:
     return ""
 
 
+def _is_inside_parentheses(text: str, pos: int) -> bool:
+    depth = 0
+    for i, ch in enumerate(text):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if i == pos:
+            return depth > 0
+    return False
+
+
 def _extract_quantity_details(line: str) -> tuple[Any, str, str]:
     pattern = re.compile(
         r"(?<![\w])(\d+(?:[.,]\d+)?)\s*(THÁNG|THANG|BUỔI|BUOI|THẺ|THE|MŨI|MUI|B|L|CC|MG)(?![\w])",
         re.IGNORECASE,
     )
-    matches = list(pattern.finditer(line))
+    all_matches = list(pattern.finditer(line))
+    # Skip matches that are inside parentheses (e.g. (2500mg))
+    matches = [m for m in all_matches if not _is_inside_parentheses(line, m.start())]
+    # Prefer match after "CÒN" keyword when multiple matches remain
+    con_pos = line.upper().find("CÒN")
+    if con_pos >= 0:
+        after_con = [m for m in matches if m.start() >= con_pos]
+        if after_con:
+            matches = after_con
+    # Otherwise use the first match (closest to start)
     detail = "; ".join(match.group(0) for match in matches)
     if not matches:
         return None, "", ""
@@ -1067,9 +1088,13 @@ def _extract_quantity_details(line: str) -> tuple[Any, str, str]:
 def _clean_inventory_service(line: str) -> str:
     text = PROFILE_CODE_RE.sub("", line)
     text = re.sub(r"\([^)]*(?:kích ngày|KÍCH NGÀY|hết hạn|HẾT HẠN)[^)]*\)", "", text)
+    text = re.sub(r"\(\d+\s*(?:B|L|CC|MG|THÁNG|THANG|THẺ|THE|MŨI|MUI)\s*\)", "", text, flags=re.IGNORECASE)
     text = re.sub(r"^[*+\-\s]+", "", text)
     text = re.sub(r"\b(?:CÒN SẴN|CÒN|CÓ)\b\s*:?", "", text, flags=re.IGNORECASE)
     text = re.sub(r"=>\s*(?:CHƯA SD|CHƯA SỬ DỤNG)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\d+\s*(?:B|L|CC|MG|THÁNG|THANG|THẺ|THE|MŨI|MUI)\s+", "", text, flags=re.IGNORECASE)
+    qty_unit = r"(?:B|L|CC|MG|THÁNG|THANG|THẺ|THE|MŨI|MUI)"
+    text = re.sub(rf"\s+\d+\s*{qty_unit}\s*$", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip(" -:")
     return text
 
@@ -1099,18 +1124,24 @@ def _extract_inventory_for_log(
             continue
 
         profile_codes = [match.group().upper() for match in PROFILE_CODE_RE.finditer(line)]
+        has_quantity_unit = bool(re.search(r"\d+\s*(?:B|L|CC|MG|THANG|THE|MUI)\b", normalized))
+        has_con_keyword = any(
+            keyword in normalized
+            for keyword in ("CON ", "CON:", "CON SAN", "CHUA SD", "CHUA SU DUNG", "CO ")
+        )
+        # Sub-item: line starts with - or * bullet and has quantity+unit
+        is_sub_item = bool(re.match(r"\s*[*\-]\s+", line)) and has_quantity_unit and not profile_codes
         has_inventory_language = (
-            any(keyword in normalized for keyword in ("CON ", "CON:", "CON SAN", "CHUA SD", "CHUA SU DUNG", "CO "))
-            and (
-                bool(profile_codes)
-                or bool(re.search(r"\d+\s*(?:B|L|CC|MG|THANG|THE|MUI)\b", normalized))
-            )
+            (has_con_keyword and (bool(profile_codes) or has_quantity_unit))
+            or is_sub_item
         )
         if not has_inventory_language:
             continue
 
         quantity, unit, quantity_detail = _extract_quantity_details(line)
         status = _inventory_status(normalized)
+        if not status and is_sub_item:
+            status = "Còn"
         service = _clean_inventory_service(line)
         owner = (primary_code, primary_name)
         event_id = _make_event_id("INV", log_key, line, status, quantity_detail)
