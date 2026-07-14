@@ -206,6 +206,10 @@ def latest_balance(financial: pd.DataFrame, event_type: str) -> float | None:
     return float(latest.iloc[-1]["Số tiền (VND)"])
 
 
+def _is_money_col(col_name: str) -> bool:
+    return "(VND)" in col_name
+
+
 def _is_num_clean(series: pd.Series) -> tuple[bool, pd.Series]:
     if pd.api.types.is_bool_dtype(series.dtype):
         return False, series
@@ -213,8 +217,11 @@ def _is_num_clean(series: pd.Series) -> tuple[bool, pd.Series]:
         return True, series
     if pd.api.types.is_datetime64_any_dtype(series.dtype):
         return False, series
-    cleaned = series.astype(str).str.replace(r"\.(?=\d{3})", "", regex=True)
-    cleaned = cleaned.str.replace(",", ".").str.replace(r"[^\d.]", "", regex=True)
+    cleaned = series.astype(str)
+    cleaned = cleaned.str.replace(r"(?i)\bVND\b|₫", "", regex=True)
+    cleaned = cleaned.str.replace(r"\.(?=\d{3}(?:\D|$))", "", regex=True)
+    cleaned = cleaned.str.replace(r",(?=\d{3}(?:\D|$))", "", regex=True)
+    cleaned = cleaned.str.replace(",", ".").str.replace(r"[^\d.\-]", "", regex=True)
     coerced = pd.to_numeric(cleaned, errors="coerce").dropna()
     return len(coerced) > 0, coerced
 
@@ -226,28 +233,51 @@ def _column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
     skip_cols = {"Chọn", "Getfly URL"}
     filters = {}
     with st.expander("🔍 Lọc theo cột", expanded=False):
-        cols = st.columns(min(4, len(df.columns)))
+        visible = [c for c in df.columns if c not in skip_cols]
+        ncols = st.columns(min(4, len(visible)) or 1)
+        visible_idx = 0
         for i, col in enumerate(df.columns):
             if col in skip_cols:
                 continue
-            with cols[i % len(cols)]:
+            with ncols[visible_idx % len(ncols)]:
+                visible_idx += 1
                 raw = df[col].dropna()
                 if raw.empty:
                     continue
+                # --- Datetime: date range picker ---
                 if pd.api.types.is_datetime64_any_dtype(raw.dtype):
-                    st.text(f"📅 {col}")
+                    min_d = raw.min().date()
+                    max_d = raw.max().date()
+                    if min_d == max_d:
+                        st.text(f"📅 {col}: {min_d}")
+                        continue
+                    sel = st.date_input(
+                        col,
+                        value=(min_d, max_d),
+                        min_value=min_d,
+                        max_value=max_d,
+                        key=f"flt_{key_prefix}_{i}_{clear_key}",
+                    )
+                    if isinstance(sel, (list, tuple)) and len(sel) == 2:
+                        if sel[0] != min_d or sel[1] != max_d:
+                            filters[col] = (sel[0], sel[1])
                     continue
+                # --- Numeric / Money: slider ---
                 is_num, coerced = _is_num_clean(raw)
                 if is_num:
                     lo, hi = float(coerced.min()), float(coerced.max())
                     if lo == hi:
                         st.text(f"{col}: {lo:,.0f}")
                         continue
+                    if _is_money_col(col):
+                        lo = 0.0
                     filters[col] = st.slider(
                         col, lo, hi, (lo, hi),
+                        format=",.2f",
                         key=f"flt_{key_prefix}_{i}_{clear_key}",
                     )
                 else:
+                    # --- Bool / String: selectbox ---
                     options = sorted(raw.unique().tolist())
                     sel = st.selectbox(
                         col,
@@ -260,19 +290,25 @@ def _column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
         if st.button("🗑️ Xoá bộ lọc", key=f"flt_btn_{key_prefix}_{clear_key}"):
             st.session_state[f"flt_clear_{key_prefix}"] = clear_key + 1
             st.rerun()
+    # --- Apply filters ---
     for col, fval in filters.items():
         if fval is None:
             continue
-        is_num, _ = _is_num_clean(df[col])
-        if is_num:
-            if isinstance(fval, (list, tuple)) and len(fval) == 2:
-                lo, hi = fval
+        # Date range
+        if isinstance(fval, tuple) and len(fval) == 2 and hasattr(fval[0], "strftime"):
+            start, end = fval
+            df = df[(df[col].dt.date >= start) & (df[col].dt.date <= end)]
+        # Numeric range (slider)
+        elif isinstance(fval, (list, tuple)) and len(fval) == 2:
+            lo, hi = fval
+            is_num, coerced = _is_num_clean(df[col])
+            if is_num:
                 if pd.api.types.is_numeric_dtype(df[col].dtype):
                     df = df[df[col].between(lo, hi, inclusive="both")]
                 else:
-                    _, coerced = _is_num_clean(df[col])
                     mask = coerced.between(lo, hi, inclusive="both")
                     df = df[mask.reindex(df.index, fill_value=False)]
+        # Exact match (string / bool)
         else:
             df = df[df[col].astype(str) == fval]
     return df.reset_index(drop=True)
