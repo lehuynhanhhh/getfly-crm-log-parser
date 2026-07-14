@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -75,6 +76,41 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# ── Session / idle check ──
+st.markdown(
+    """
+    <script>
+    const p = new URLSearchParams(window.location.search);
+    if (!p.has('_sess')) {
+        const s = sessionStorage.getItem('gf_sess');
+        if (s) {
+            window.history.replaceState({}, '', '?_sess=' + s + window.location.hash);
+        } else {
+            const t = Date.now().toString();
+            sessionStorage.setItem('gf_sess', t);
+            window.history.replaceState({}, '', '?_sess=' + t + window.location.hash);
+        }
+    }
+    </script>
+    """,
+    unsafe_allow_html=True,
+)
+_sess = st.query_params.get("_sess", [""])[0]
+if _sess == "NEW" and st.session_state.get("authenticated"):
+    st.session_state.authenticated = False
+    st.rerun()
+elif st.session_state.get("authenticated"):
+    now = time.time()
+    last = st.session_state.get("last_activity", now)
+    idle = now - last
+    if idle > 60:
+        st.warning("⚠️ Phiên đăng nhập hết hạn do không hoạt động quá 60 phút.")
+        st.session_state.authenticated = False
+        st.rerun()
+    elif idle > 10:
+        st.toast("⚠️ Bạn sắp bị đăng xuất do không hoạt động quá 10 phút.")
+    st.session_state.last_activity = now
 
 # ── Auth ──
 if "authenticated" not in st.session_state:
@@ -179,11 +215,17 @@ def _column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
         cols = st.columns(min(4, len(df.columns)))
         for i, col in enumerate(df.columns):
             with cols[i % len(cols)]:
-                series = df[col].dropna()
-                if series.empty:
+                raw = df[col].dropna()
+                if raw.empty:
                     continue
-                if pd.api.types.is_numeric_dtype(series.dtype):
-                    lo, hi = float(series.min()), float(series.max())
+                if pd.api.types.is_numeric_dtype(raw.dtype):
+                    coerced = raw
+                    is_num = True
+                else:
+                    coerced = pd.to_numeric(raw, errors="coerce").dropna()
+                    is_num = len(coerced) > 0
+                if is_num:
+                    lo, hi = float(coerced.min()), float(coerced.max())
                     if lo == hi:
                         st.text(f"{col}: {lo:.0f}")
                         continue
@@ -192,7 +234,7 @@ def _column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
                         key=f"flt_{key_prefix}_{i}_{clear_key}",
                     )
                 else:
-                    options = sorted(series.unique().tolist())
+                    options = sorted(raw.unique().tolist())
                     sel = st.selectbox(
                         col,
                         ["", *options],
