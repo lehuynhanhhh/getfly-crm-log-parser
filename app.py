@@ -1,8 +1,68 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from datetime import datetime
+
+
+# ── Test mode ──
+if "--test" in sys.argv:
+    import os
+    import pandas as pd
+
+    def _infer_filter_type(col, series):
+        raw = series.dropna()
+        if raw.empty:
+            return "id"
+        if pd.api.types.is_bool_dtype(raw.dtype):
+            return "sel"
+        if pd.api.types.is_datetime64_any_dtype(raw.dtype):
+            return "date"
+        if pd.api.types.is_numeric_dtype(raw.dtype) and raw.nunique() >= 2:
+            return "num"
+        return "sel"
+
+    def _clean_vnd_series(series):
+        cleaned = series.astype(str)
+        cleaned = cleaned.str.replace(r"(?i)\bVND\b", "", regex=True)
+        cleaned = cleaned.str.replace(r"\.(?=\d{3}(?:\D|$))", "", regex=True)
+        cleaned = cleaned.str.replace(r",(?=\d{3}(?:\D|$))", "", regex=True)
+        cleaned = cleaned.str.replace(",", ".").str.replace(r"[^\d.\-]", "", regex=True)
+        return pd.to_numeric(cleaned, errors="coerce")
+
+    errors = 0
+    def check(cond, msg):
+        global errors
+        if not cond:
+            print(f"  FAIL: {msg}", flush=True)
+            errors += 1
+        else:
+            print(f"  OK:   {msg}", flush=True)
+
+    check(_infer_filter_type("", pd.Series(["KH440297", "KH123456"])) == "sel", "KH440297 -> sel")
+    check(_infer_filter_type("", pd.Series(["HS250857315", "HS98765432"])) == "sel", "HS250857315 -> sel")
+    check(_infer_filter_type("", pd.Series(["16:03", "09:30"])) == "sel", "16:03 (Gio) -> sel")
+    check(_infer_filter_type("", pd.Series(["11/07/2026", "12/07/2026"])) == "sel", "11/07/2026 (Ngay) -> sel")
+    check(_infer_filter_type("", pd.to_datetime(pd.Series(["2026-07-11", "2026-07-12"]))) == "date", "datetime64 -> date")
+    check(_infer_filter_type("", pd.Series([1, 2, 3])) == "num", "int [1,2,3] -> num")
+    check(_infer_filter_type("", pd.Series([True, False])) == "sel", "bool -> sel")
+    check(_infer_filter_type("", pd.Series([1, 1, 1])) == "sel", "single-value [1,1,1] -> sel (no slider)")
+    check(_infer_filter_type("", pd.Series([], dtype=float)) == "id", "empty series -> id")
+
+    def _clean(s):
+        return _clean_vnd_series(s).tolist()
+
+    check(_clean(pd.Series(["1.500.000", "2.000.000"])) == [1500000, 2000000], "1.500.000 -> 1500000")
+    check(_clean(pd.Series(["1.500.000 VND", "2.000.000 VND"])) == [1500000, 2000000], "1.500.000 VND -> 1500000")
+    check(abs(_clean(pd.Series(["1.500.000,50"]))[0] - 1500000.5) < 0.01, "1.500.000,50 -> 1500000.5")
+    check(_clean(pd.Series(["1,500,000.00"])) == [1500000], "1,500,000.00 -> 1500000")
+    check(all(pd.isna(_clean(pd.Series(["abc"])))), "abc -> NaN")
+
+    total = 14
+    passed = total - errors
+    print(f"\n{'-' * 40}\nPassed: {passed}/{total}", flush=True)
+    os._exit(0 if errors == 0 else 1)
 
 import pandas as pd
 import streamlit as st
@@ -206,82 +266,175 @@ def latest_balance(financial: pd.DataFrame, event_type: str) -> float | None:
     return float(latest.iloc[-1]["Số tiền (VND)"])
 
 
-def _is_money_col(col_name: str) -> bool:
-    return "(VND)" in col_name
+# ── Column filter type constants ──
+# skip  — hidden
+# id    — no widget
+# date  — st.date_input range
+# curr  — st.slider 0→max
+# num   — st.slider min→max
+# sel   — st.selectbox exact match
+# text  — st.text_input contains search
+
+_COLUMN_CONFIG: dict[str, str] = {
+    # skip
+    "Chọn": "skip",
+    "Getfly URL": "skip",
+    # id (technical)
+    "STT": "id",
+    "Log key": "id",
+    "Financial event ID": "id",
+    "Inventory event ID": "id",
+    "Mention ID": "id",
+    # date
+    "Thời gian ghi nhận": "date",
+    "Ngày": "date",
+    # text (date-like strings that must NOT be parsed as numeric)
+    "Ngày dịch vụ": "text",
+    "Ngày kích hoạt": "text",
+    "Hạn sử dụng": "text",
+    # time (also string, not numeric)
+    "Giờ": "sel",
+    # select (identifiers / short codes)
+    "Mã KH chính": "sel",
+    "Mã trạng thái": "sel",
+    "Mã hồ sơ HS": "sel",
+    "Mã KH": "sel",
+    # select (business text with few distinct values)
+    "Tên khách hàng chính": "sel",
+    "Nguồn KH chính": "sel",
+    "Nguồn thời gian": "sel",
+    "Người ghi (nguyên bản)": "sel",
+    "Vai trò/Bộ phận": "sel",
+    "Người phụ trách": "sel",
+    "Đã chỉnh sửa": "sel",
+    "Trạng thái chuẩn": "sel",
+    "Nhóm nội dung": "sel",
+    "Cơ sở": "sel",
+    "Tên KH được nhắc": "sel",
+    "Tên KH sử dụng dịch vụ": "sel",
+    "Tên KH nguồn tiền/thẻ": "sel",
+    "Tên KH sở hữu": "sel",
+    "Tình trạng thanh toán": "sel",
+    "Trạng thái nghiệp vụ": "sel",
+    "Độ tin cậy": "sel",
+    "Loại sự kiện tài chính": "sel",
+    "Góc nhìn công nợ": "sel",
+    "Tài khoản/Nguồn tiền": "sel",
+    "Trạng thái tồn": "sel",
+    "Đơn vị chính": "sel",
+    "Là quà tặng": "sel",
+    "Vai trò trong log": "sel",
+    "Mã KH sở hữu": "sel",
+    # text (long content → substring search)
+    "Mã KH được nhắc": "text",
+    "Mã KH sử dụng dịch vụ": "text",
+    "Mã KH nguồn tiền/thẻ": "text",
+    "Nội dung gốc": "text",
+    "Dòng nguồn": "text",
+    "Dịch vụ/Gói còn lại": "text",
+    "Chi tiết số lượng": "text",
+    "Bằng chứng mẫu": "text",
+    # currency (slider 0→max)
+    "Giá trị mua (VND)": "curr",
+    "Đã thanh toán (VND)": "curr",
+    "KH còn nợ công ty (VND)": "curr",
+    "Công ty phải trả/ghi có KH (VND)": "curr",
+    "Số tiền trừ cọc/thẻ (VND)": "curr",
+    "Số dư cọc (VND)": "curr",
+    "Số dư TK chính (VND)": "curr",
+    "Số dư TK tặng (VND)": "curr",
+    "Số dư voucher (VND)": "curr",
+    "Tiền tặng/khuyến mãi (VND)": "curr",
+    "Tiền bù thêm (VND)": "curr",
+    "Số tiền (VND)": "curr",
+    # numeric (slider min→max)
+    "Số lượng chính": "num",
+    "Điểm nhận diện": "num",
+    "Số lần xuất hiện": "num",
+    "Tỷ lệ giảm/tặng": "num",
+}
 
 
-def _is_num_clean(series: pd.Series) -> tuple[bool, pd.Series]:
-    if pd.api.types.is_bool_dtype(series.dtype):
-        return False, series
-    if pd.api.types.is_numeric_dtype(series.dtype):
-        return True, series
-    if pd.api.types.is_datetime64_any_dtype(series.dtype):
-        return False, series
+def _infer_filter_type(col: str, series: pd.Series) -> str:
+    raw = series.dropna()
+    if raw.empty:
+        return "id"
+    if pd.api.types.is_bool_dtype(raw.dtype):
+        return "sel"
+    if pd.api.types.is_datetime64_any_dtype(raw.dtype):
+        return "date"
+    if pd.api.types.is_numeric_dtype(raw.dtype) and raw.nunique() >= 2:
+        return "num"
+    return "sel"
+
+
+def _clean_vnd_series(series: pd.Series) -> pd.Series:
     cleaned = series.astype(str)
     cleaned = cleaned.str.replace(r"(?i)\bVND\b|₫", "", regex=True)
     cleaned = cleaned.str.replace(r"\.(?=\d{3}(?:\D|$))", "", regex=True)
     cleaned = cleaned.str.replace(r",(?=\d{3}(?:\D|$))", "", regex=True)
     cleaned = cleaned.str.replace(",", ".").str.replace(r"[^\d.\-]", "", regex=True)
-    coerced = pd.to_numeric(cleaned, errors="coerce").dropna()
-    return len(coerced) > 0, coerced
+    return pd.to_numeric(cleaned, errors="coerce")
 
 
 def _column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
     if df.empty:
         return df
     clear_key = st.session_state.get(f"flt_clear_{key_prefix}", 0)
-    skip_cols = {"Chọn", "Getfly URL"}
-    filters = {}
+    filters: dict[str, Any] = {}
     with st.expander("🔍 Lọc theo cột", expanded=False):
-        visible = [c for c in df.columns if c not in skip_cols]
+        visible = [c for c in df.columns if _COLUMN_CONFIG.get(c, _infer_filter_type(c, df[c])) not in ("skip", "id")]
         ncols = st.columns(min(4, len(visible)) or 1)
         visible_idx = 0
         for i, col in enumerate(df.columns):
-            if col in skip_cols:
+            ftype = _COLUMN_CONFIG.get(col) or _infer_filter_type(col, df[col])
+            if ftype in ("skip", "id"):
                 continue
             with ncols[visible_idx % len(ncols)]:
                 visible_idx += 1
                 raw = df[col].dropna()
                 if raw.empty:
                     continue
-                # --- Datetime: date range picker ---
-                if pd.api.types.is_datetime64_any_dtype(raw.dtype):
-                    min_d = raw.min().date()
-                    max_d = raw.max().date()
+                if ftype == "date":
+                    if pd.api.types.is_datetime64_any_dtype(raw.dtype):
+                        min_d = raw.min().date()
+                        max_d = raw.max().date()
+                    else:
+                        continue
                     if min_d == max_d:
                         st.text(f"📅 {col}: {min_d}")
                         continue
                     sel = st.date_input(
-                        col,
-                        value=(min_d, max_d),
-                        min_value=min_d,
-                        max_value=max_d,
+                        col, (min_d, max_d), min_d, max_d,
                         key=f"flt_{key_prefix}_{i}_{clear_key}",
                     )
                     if isinstance(sel, (list, tuple)) and len(sel) == 2:
                         if sel[0] != min_d or sel[1] != max_d:
                             filters[col] = (sel[0], sel[1])
-                    continue
-                # --- Numeric / Money: slider ---
-                is_num, coerced = _is_num_clean(raw)
-                if is_num:
-                    lo, hi = float(coerced.min()), float(coerced.max())
-                    if lo == hi:
-                        st.text(f"{col}: {lo:,.0f}")
+                elif ftype in ("curr", "num"):
+                    if pd.api.types.is_numeric_dtype(raw.dtype):
+                        vmin, vmax = float(raw.min()), float(raw.max())
+                    else:
+                        coerced = _clean_vnd_series(raw).dropna()
+                        if coerced.empty:
+                            continue
+                        vmin, vmax = float(coerced.min()), float(coerced.max())
+                    if vmin == vmax:
+                        st.text(f"{col}: {vmax:,.0f}")
                         continue
-                    if _is_money_col(col):
-                        lo = 0.0
+                    lo = 0.0 if ftype == "curr" else vmin
                     filters[col] = st.slider(
-                        col, lo, hi, (lo, hi),
-                        format=",.2f",
+                        col, lo, vmax, (lo, vmax),
                         key=f"flt_{key_prefix}_{i}_{clear_key}",
                     )
+                elif ftype == "text":
+                    val = st.text_input(col, placeholder="Tìm kiếm…", key=f"flt_{key_prefix}_{i}_{clear_key}")
+                    if val:
+                        filters[col] = val
                 else:
-                    # --- Bool / String: selectbox ---
                     options = sorted(raw.unique().tolist())
                     sel = st.selectbox(
-                        col,
-                        ["", *options],
+                        col, ["", *options],
                         format_func=lambda x: "Tất cả" if x == "" else str(x),
                         key=f"flt_{key_prefix}_{i}_{clear_key}",
                     )
@@ -290,27 +443,32 @@ def _column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
         if st.button("🗑️ Xoá bộ lọc", key=f"flt_btn_{key_prefix}_{clear_key}"):
             st.session_state[f"flt_clear_{key_prefix}"] = clear_key + 1
             st.rerun()
-    # --- Apply filters ---
     for col, fval in filters.items():
         if fval is None:
             continue
-        # Date range
-        if isinstance(fval, tuple) and len(fval) == 2 and hasattr(fval[0], "strftime"):
+        ftype = _COLUMN_CONFIG.get(col) or _infer_filter_type(col, df[col])
+        if ftype == "date":
             start, end = fval
             df = df[(df[col].dt.date >= start) & (df[col].dt.date <= end)]
-        # Numeric range (slider)
-        elif isinstance(fval, (list, tuple)) and len(fval) == 2:
+        elif ftype == "curr":
             lo, hi = fval
-            is_num, coerced = _is_num_clean(df[col])
-            if is_num:
-                if pd.api.types.is_numeric_dtype(df[col].dtype):
-                    df = df[df[col].between(lo, hi, inclusive="both")]
-                else:
-                    mask = coerced.between(lo, hi, inclusive="both")
-                    df = df[mask.reindex(df.index, fill_value=False)]
-        # Exact match (string / bool)
+            if pd.api.types.is_numeric_dtype(df[col].dtype):
+                df = df[df[col].between(lo, hi, inclusive="both")]
+            else:
+                mask = _clean_vnd_series(df[col]).between(lo, hi, inclusive="both")
+                df = df[mask.reindex(df.index, fill_value=False)]
+        elif ftype == "num":
+            lo, hi = fval
+            if pd.api.types.is_numeric_dtype(df[col].dtype):
+                df = df[df[col].between(lo, hi, inclusive="both")]
+            else:
+                coerced = pd.to_numeric(df[col].astype(str), errors="coerce")
+                mask = coerced.between(lo, hi, inclusive="both")
+                df = df[mask.reindex(df.index, fill_value=False)]
+        elif ftype == "text":
+            df = df[df[col].astype(str).str.contains(str(fval), case=False, na=False)]
         else:
-            df = df[df[col].astype(str) == fval]
+            df = df[df[col].astype(str) == str(fval)]
     return df.reset_index(drop=True)
 
 
