@@ -192,23 +192,27 @@ def _column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
                         key=f"flt_{key_prefix}_{i}_{clear_key}",
                     )
                 else:
-                    filters[col] = st.text_input(
-                        col, "",
+                    options = sorted(series.unique().tolist())
+                    sel = st.selectbox(
+                        col,
+                        ["", *options],
+                        format_func=lambda x: x if x else "Tất cả",
                         key=f"flt_{key_prefix}_{i}_{clear_key}",
-                    ).strip().lower()
+                    )
+                    if sel:
+                        filters[col] = sel
         if st.button("🗑️ Xoá bộ lọc", key=f"flt_btn_{key_prefix}_{clear_key}"):
             st.session_state[f"flt_clear_{key_prefix}"] = clear_key + 1
             st.rerun()
     for col, fval in filters.items():
         if fval is None:
             continue
-        series = df[col].dropna()
-        if pd.api.types.is_numeric_dtype(series.dtype):
+        if pd.api.types.is_numeric_dtype(df[col].dtype):
             if isinstance(fval, (list, tuple)) and len(fval) == 2:
                 lo, hi = fval
                 df = df[df[col].between(lo, hi, inclusive="both")]
-        elif fval:
-            df = df[df[col].astype(str).str.lower().str.contains(fval, na=False)]
+        else:
+            df = df[df[col].astype(str) == fval]
     return df
 
 
