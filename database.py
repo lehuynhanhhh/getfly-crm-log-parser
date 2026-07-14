@@ -364,6 +364,29 @@ def load_mentions(
     return _load_json_rows("customer_mentions", customer_code, limit, db_path)
 
 
+def delete_logs(log_keys: list[str], db_path: Path = DB_PATH) -> int:
+    if not log_keys:
+        return 0
+    init_db(db_path)
+    placeholders = ",".join("?" for _ in log_keys)
+    with _connect(db_path) as conn:
+        _delete_children_for_logs(conn, log_keys)
+        conn.execute(
+            f"DELETE FROM crm_logs_v2 WHERE log_key IN ({placeholders})",
+            log_keys,
+        )
+    return len(log_keys)
+
+
+def delete_all_data(db_path: Path = DB_PATH) -> dict[str, int]:
+    init_db(db_path)
+    counts = {}
+    with _connect(db_path) as conn:
+        for table in ["customer_mentions", "service_inventory", "financial_events", "crm_logs_v2", "customers"]:
+            counts[table] = conn.execute(f"DELETE FROM {table}").rowcount
+    return counts
+
+
 def database_stats(db_path: Path = DB_PATH) -> tuple[int, int, int, int]:
     init_db(db_path)
     with _connect(db_path) as conn:

@@ -9,6 +9,8 @@ import streamlit as st
 from crm_parser import DEFAULT_STATUS_MAPPING, parse_crm_bundle
 from database import (
     database_stats,
+    delete_all_data,
+    delete_logs,
     init_db,
     load_financial_events,
     load_inventory,
@@ -20,7 +22,7 @@ from excel_export import build_excel_bytes
 
 
 st.set_page_config(
-    page_title="Getfly CRM Log Parser",
+    page_title="Getfly CRM Log",
     page_icon="📋",
     layout="wide",
 )
@@ -398,56 +400,217 @@ with tab_history:
         key="history_customer_code_v12",
     ).strip().upper()
 
+    refresh_key = st.session_state.get("history_refresh", 0)
+
     history_tabs = st.tabs(
         ["CRM Log", "Financial Events", "Service Inventory / HS", "Related Customers"]
     )
 
+    tab_keys = ["crm_logs_v2", "financial_events", "service_inventory", "customer_mentions"]
     history_frames = [
         load_logs(search_code),
         load_financial_events(search_code),
         load_inventory(search_code),
         load_mentions(search_code),
     ]
-    for history_tab, frame in zip(history_tabs, history_frames):
+
+    st.markdown("---")
+    col_delete_sel, col_delete_all, _ = st.columns([1, 1, 2])
+    with col_delete_sel:
+        if st.button("Xoá dòng đã chọn", type="secondary", use_container_width=True):
+            selected = st.session_state.get("history_checked_rows", set())
+            if selected:
+                all_keys = []
+                for tab_idx, frame in enumerate(history_frames):
+                    if not frame.empty:
+                        id_col = ["Log key", "Log key", "Log key", "Log key"][tab_idx]
+                        if id_col in frame.columns:
+                            for row_idx in list(selected):
+                                if row_idx < len(frame):
+                                    all_keys.append(str(frame.iloc[row_idx].get(id_col, "")))
+                deleted = delete_logs([k for k in all_keys if k])
+                if deleted:
+                    st.success(f"Đã xoá {deleted} log và dữ liệu liên quan.")
+                    st.session_state["history_refresh"] = refresh_key + 1
+                    st.rerun()
+                else:
+                    st.warning("Không có dòng nào được chọn hoặc log key không hợp lệ.")
+            else:
+                st.warning("Vui lòng chọn ít nhất một dòng để xoá.")
+    with col_delete_all:
+        if st.button("Xoá toàn bộ database", type="secondary", use_container_width=True):
+            st.session_state["confirm_delete_all"] = True
+
+    if st.session_state.get("confirm_delete_all"):
+        st.warning("Bạn có chắc chắn muốn xoá TOÀN BỘ dữ liệu? Hành động này không thể hoàn tác.")
+        c_confirm, c_cancel = st.columns([1, 1])
+        with c_confirm:
+            if st.button("Xác nhận xoá tất cả", type="primary", use_container_width=True):
+                counts = delete_all_data()
+                total = sum(counts.values())
+                st.success(f"Đã xoá {total} dòng khỏi database.")
+                st.session_state["confirm_delete_all"] = False
+                st.session_state["history_refresh"] = refresh_key + 1
+                st.rerun()
+        with c_cancel:
+            if st.button("Huỷ", use_container_width=True):
+                st.session_state["confirm_delete_all"] = False
+                st.rerun()
+
+    for tab_idx, (history_tab, frame) in enumerate(zip(history_tabs, history_frames)):
         with history_tab:
             if frame.empty:
                 st.info("Chưa có dữ liệu phù hợp.")
             else:
-                st.dataframe(
+                frame = frame.reset_index(drop=True)
+                id_col = ["Log key", "Log key", "Log key", "Log key"][tab_idx]
+                selection_key = f"history_select_{tab_idx}_{refresh_key}"
+                selected_rows = st.dataframe(
                     frame,
                     hide_index=True,
                     use_container_width=True,
                     height=540,
+                    on_select="rerun",
+                    selection_mode="multi",
+                    key=selection_key,
                 )
+                checked = set()
+                if selected_rows and hasattr(selected_rows, "selection"):
+                    for r in selected_rows.selection.rows:
+                        checked.add(r)
+                st.session_state["history_checked_rows"] = checked
 
 
 with tab_guide:
-    st.subheader("Các bảng dữ liệu")
+    st.subheader("Tổng quan ứng dụng")
     st.markdown(
         """
-**CRM Log** — một dòng cho mỗi hoạt động CRM. Mã và tên khách hàng chính được
-điền trên toàn bộ dòng.
+Ứng dụng **Getfly CRM Log** giúp tự động hoá việc trích xuất và phân tích dữ liệu
+từ lịch sử CRM của khách hàng trên Getfly. Thay vì đọc thủ công từng dòng ghi chú,
+bạn chỉ cần paste toàn bộ lịch sử CRM vào ô nhập liệu — hệ thống sẽ tự động nhận
+diện khách hàng chính, tách log, truy xuất số tiền, công nợ, tồn dịch vụ và hồ sơ.
 
-**Financial Events** — một dòng cho mỗi sự kiện tiền:
+---
 
-- Giá trị mua/gói
-- Khách thanh toán
-- Khách còn nợ công ty
-- Công ty phải trả hoặc ghi có khách hàng
-- Công ty còn nợ thuốc/dịch vụ
-- Tiền trừ cọc, thẻ hoặc tài khoản
-- Số dư cọc, tài khoản chính, tài khoản tặng và voucher
-- Tiền tặng, giảm giá và tiền bù thêm
+### 1. Paste & xử lý
 
-**Service Inventory / HS** — tồn dịch vụ, số lượng, đơn vị, trạng thái,
-ngày kích hoạt, hạn sử dụng và toàn bộ mã hồ sơ bắt đầu bằng `HS`.
+**Đầu vào**
+- **Mã KH chính** (không bắt buộc): Nhập thủ công nếu bạn biết trước mã khách hàng.
+  Để trống nếu muốn hệ thống tự tìm từ dữ liệu CRM.
+- **Tên KH chính** (không bắt buộc): Tương tự, nhập nếu có sẵn.
+- **Cơ sở mặc định**: Chọn cơ sở (D1/HCM, D5/HCM, D2/HN hoặc Khác) để gán cho
+  toàn bộ dữ liệu.
+- **Getfly URL**: Đường dẫn đến trang CRM trên Getfly để tiện tra cứu sau này.
 
-**Related Customers** — phân biệt khách hàng chính, người sử dụng dịch vụ,
-chủ thẻ/chủ nguồn tiền và những khách hàng khác được nhắc trong log.
+**Paste dữ liệu**: Sao chép toàn bộ lịch sử CRM từ Getfly (thường bắt đầu mỗi log
+bằng tên người ghi + ngày giờ) và paste vào ô văn bản, sau đó bấm **"Phân tích dữ liệu"**.
 
-### Nguyên tắc kiểm tra
+**Kết quả**
+- Hệ thống nhận diện **khách hàng chính** dựa trên tần suất xuất hiện trong log.
+- Toàn bộ log được gán mã và tên khách hàng chính.
+- Các bảng dữ liệu chi tiết được sinh ra: CRM Log, Financial Events,
+  Service Inventory / HS, Related Customers.
 
-Các số tiền được nhận diện từ ghi chú tự do. Luôn kiểm tra các dòng có độ
-tin cậy Trung bình hoặc Thấp trước khi sử dụng cho báo cáo tài chính chính thức.
+**Nếu có nhiều khách hàng trong cùng một chuỗi log** (ví dụ: chủ thẻ và người dùng),
+bạn có thể chọn lại khách hàng chính từ danh sách gợi ý và bấm **"Áp dụng"** để
+phân tích lại.
+
+---
+
+### 2. Dữ liệu đã lưu
+
+Tab này cho phép tra cứu dữ liệu đã được lưu vào database SQLite.
+
+**Tra cứu**: Nhập mã khách hàng vào ô tìm kiếm để lọc dữ liệu. Để trống để xem
+dữ liệu gần nhất.
+
+**Các bảng dữ liệu**
+
+| Bảng | Mô tả | Cột chính |
+|------|-------|-----------|
+| **CRM Log** | Mỗi dòng là một hoạt động CRM (gọi điện, chăm sóc, ghi chú, thanh toán...) | Log key, Thời gian ghi nhận, Mã KH chính, Tên khách hàng chính, Trạng thái, Nội dung CRM |
+| **Financial Events** | Mỗi dòng là một sự kiện tài chính được trích xuất | Financial event ID, Loại sự kiện tài chính, Số tiền (VND), Độ tin cậy, Log key |
+| **Service Inventory / HS** | Tồn dịch vụ, gói còn lại và mã hồ sơ HS | Inventory event ID, Dịch vụ/Gói còn lại, Số lượng, Đơn vị, Mã hồ sơ HS, Ngày kích hoạt, Hạn sử dụng |
+| **Related Customers** | Các khách hàng liên quan được nhắc đến trong log | Mention ID, Mã KH được nhắc, Vai trò trong log, Log key |
+
+**Các loại sự kiện tài chính được hỗ trợ**
+
+1. **Giá trị mua/gói** — Số tiền của gói dịch vụ hoặc sản phẩm được mua.
+2. **Khách thanh toán** — Số tiền khách hàng đã thanh toán.
+3. **Khách còn nợ công ty** — Số dư nợ phải thu từ khách hàng.
+4. **Công ty phải trả / ghi có khách hàng** — Tiền hoàn lại hoặc bồi hoàn cho khách.
+5. **Công ty còn nợ thuốc/dịch vụ** — Giá trị dịch vụ chưa hoàn thành.
+6. **Tiền trừ cọc, thẻ hoặc tài khoản** — Các khoản khấu trừ từ nguồn tiền có sẵn.
+7. **Số dư cọc** — Số tiền cọc còn lại của khách hàng.
+8. **Số dư tài khoản chính** — Số dư trong tài khoản chính.
+9. **Số dư tài khoản tặng** — Số dư trong tài khoản khuyến mãi / tặng.
+10. **Số dư voucher** — Giá trị voucher còn lại.
+11. **Tiền tặng** — Tiền được cấp thêm từ chương trình khuyến mãi.
+12. **Giảm giá** — Chiết khấu hoặc giảm giá trực tiếp.
+13. **Tiền bù thêm** — Khoản bù chênh lệch từ công ty.
+
+**Quản lý dữ liệu**
+- **Xoá dòng đã chọn**: Đánh dấu các dòng trong bảng, sau đó bấm nút để xoá.
+- **Xoá toàn bộ database**: Xoá sạch tất cả dữ liệu trong database (cần xác nhận).
+
+---
+
+### 3. Service Inventory / HS — Chi tiết
+
+Bảng này ghi nhận các dịch vụ / gói còn tồn của khách hàng. Mỗi dòng bao gồm:
+
+- **Dịch vụ/Gói còn lại**: Tên gói dịch vụ hoặc sản phẩm.
+- **Số lượng**: Số lượng còn lại (có thể là số lần, liệu trình, buổi...).
+- **Đơn vị**: Đơn vị tính (buổi, liệu trình, tháng, chai, lọ...).
+- **Trạng thái**: Trạng thái hiện tại (còn hiệu lực, đã hết, đã huỷ...).
+- **Ngày kích hoạt**: Ngày gói dịch vụ bắt đầu có hiệu lực.
+- **Hạn sử dụng**: Ngày hết hạn của gói dịch vụ.
+- **Mã hồ sơ HS**: Danh sách mã hồ sơ liên quan (bắt đầu bằng `HS`), cách nhau bởi dấu phẩy.
+
+---
+
+### 4. Related Customers — Vai trò trong log
+
+Hệ thống phân loại các khách hàng được nhắc đến trong log theo các vai trò sau:
+
+| Vai trò | Mô tả |
+|---------|-------|
+| **Khách hàng chính** | Khách hàng được xác định là chủ thể chính của toàn bộ dữ liệu |
+| **Người sử dụng dịch vụ** | Người trực tiếp sử dụng dịch vụ / sản phẩm (có thể khác người mua) |
+| **Chủ thẻ / chủ nguồn tiền** | Người sở hữu thẻ thành viên hoặc nguồn thanh toán |
+| **Khác** | Các khách hàng khác được nhắc đến trong ghi chú |
+
+---
+
+### 5. Nguyên tắc kiểm tra và độ tin cậy
+
+Các số tiền được nhận diện từ **văn bản ghi chú tự do**, không phải từ trường
+dữ liệu có cấu trúc. Do đó, độ chính xác phụ thuộc vào:
+
+1. **Tính nhất quán của dữ liệu đầu vào**: Nếu CRM được ghi theo một format nhất
+   định, tỷ lệ nhận diện đúng sẽ cao.
+2. **Độ tin cậy (Confidence)**:
+   - **Cao**: Số tiền được tìm thấy ngay sau từ khoá rõ ràng (Tổng tiền, Thanh toán...).
+   - **Trung bình**: Số tiền được suy luận từ ngữ cảnh nhưng không có từ khoá trực tiếp.
+   - **Thấp**: Số tiền được ước lượng từ các dữ liệu xung quanh, cần kiểm tra thủ công.
+
+**Khuyến nghị**: Luôn kiểm tra các dòng có độ tin cậy **Trung bình** hoặc **Thấp**
+trước khi sử dụng cho báo cáo tài chính chính thức.
+
+---
+
+### 6. Xuất dữ liệu
+
+Sau khi phân tích, bạn có thể **xuất Excel** đầy đủ các bảng dữ liệu — mỗi bảng
+là một sheet riêng trong cùng một file. File Excel bao gồm:
+
+- Sheet **Hướng dẫn** — thông tin metadata và chú thích.
+- Sheet **CRM Log** — toàn bộ log đã được xử lý.
+- Sheet **Financial Events** — tất cả sự kiện tài chính.
+- Sheet **Service Inventory** — tồn dịch vụ / hồ sơ.
+- Sheet **Related Customers** — khách hàng liên quan.
+- Sheet **Raw CRM** — dữ liệu gốc paste vào.
+
+---
         """
     )
