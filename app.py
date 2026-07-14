@@ -464,20 +464,22 @@ with tab_history:
             else:
                 frame = frame.reset_index(drop=True)
                 id_col = ["Log key", "Log key", "Log key", "Log key"][tab_idx]
+                frame_with_check = frame.copy()
+                frame_with_check.insert(0, "Chọn", False)
+                disabled_cols = [c for c in frame_with_check.columns if c != "Chọn"]
                 selection_key = f"history_select_{tab_idx}_{refresh_key}"
-                selected_rows = st.dataframe(
-                    frame,
+                edited = st.data_editor(
+                    frame_with_check,
+                    column_config={
+                        "Chọn": st.column_config.CheckboxColumn("Chọn", default=False),
+                    },
                     hide_index=True,
                     use_container_width=True,
                     height=540,
-                    on_select="rerun",
-                    selection_mode="multi",
+                    disabled=disabled_cols,
                     key=selection_key,
                 )
-                checked = set()
-                if selected_rows and hasattr(selected_rows, "selection"):
-                    for r in selected_rows.selection.rows:
-                        checked.add(r)
+                checked = set(edited[edited["Chọn"] == True].index)
                 st.session_state["history_checked_rows"] = checked
 
 
