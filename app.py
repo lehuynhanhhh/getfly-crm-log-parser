@@ -20,7 +20,7 @@ from excel_export import build_excel_bytes
 
 
 st.set_page_config(
-    page_title="Getfly CRM Log",
+    page_title="Getfly CRM Log Parser",
     page_icon="📋",
     layout="wide",
 )
