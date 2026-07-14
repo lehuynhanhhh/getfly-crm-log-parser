@@ -132,7 +132,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
     with _connect(db_path) as conn:
         _init_schema(conn)
         _migrate_users(conn)
-    seed_admin(db_path)
+        _seed_admin(conn)
 
 
 def _migrate_users(conn) -> None:
@@ -142,19 +142,21 @@ def _migrate_users(conn) -> None:
 
 
 def seed_admin(db_path: Path = DB_PATH) -> None:
-    import bcrypt
     init_db(db_path)
-    with _connect(db_path) as conn:
-        exists = _execute(
-            conn, "SELECT 1 FROM users WHERE email = ?", ("admin@driphydration.vn",)
-        ).fetchone()
-        if not exists:
-            pw_hash = bcrypt.hashpw(b"Financeteam@123", bcrypt.gensalt()).decode()
-            _execute(
-                conn,
-                "INSERT INTO users (email, password_hash, role) VALUES (?, ?, ?)",
-                ("admin@driphydration.vn", pw_hash, "admin"),
-            )
+
+
+def _seed_admin(conn) -> None:
+    import bcrypt
+    exists = _execute(
+        conn, "SELECT 1 FROM users WHERE email = ?", ("admin@driphydration.vn",)
+    ).fetchone()
+    if not exists:
+        pw_hash = bcrypt.hashpw(b"Financeteam@123", bcrypt.gensalt()).decode()
+        _execute(
+            conn,
+            "INSERT INTO users (email, password_hash, role) VALUES (?, ?, ?)",
+            ("admin@driphydration.vn", pw_hash, "admin"),
+        )
 
 
 def _json_value(value: Any) -> Any:
