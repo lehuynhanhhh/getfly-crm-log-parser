@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-import sqlite3
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -18,80 +18,113 @@ TABLE_MAP = {
     "customer_mentions": "customer_mentions",
 }
 
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS customers (
+    customer_code TEXT PRIMARY KEY,
+    customer_name TEXT,
+    branch TEXT,
+    getfly_url TEXT,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS crm_logs_v2 (
+    log_key TEXT PRIMARY KEY,
+    customer_code TEXT,
+    customer_name TEXT,
+    logged_at TEXT,
+    payload_json TEXT NOT NULL,
+    imported_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS financial_events (
+    event_id TEXT PRIMARY KEY,
+    log_key TEXT,
+    customer_code TEXT,
+    logged_at TEXT,
+    event_type TEXT,
+    amount_vnd REAL,
+    payload_json TEXT NOT NULL,
+    imported_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS service_inventory (
+    event_id TEXT PRIMARY KEY,
+    log_key TEXT,
+    customer_code TEXT,
+    logged_at TEXT,
+    profile_codes TEXT,
+    service_name TEXT,
+    payload_json TEXT NOT NULL,
+    imported_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS customer_mentions (
+    mention_id TEXT PRIMARY KEY,
+    log_key TEXT,
+    customer_code TEXT,
+    mentioned_customer_code TEXT,
+    role_in_log TEXT,
+    payload_json TEXT NOT NULL,
+    imported_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_crm_logs_v2_customer ON crm_logs_v2(customer_code);
+CREATE INDEX IF NOT EXISTS idx_financial_customer ON financial_events(customer_code);
+CREATE INDEX IF NOT EXISTS idx_inventory_customer ON service_inventory(customer_code);
+CREATE INDEX IF NOT EXISTS idx_mentions_customer ON customer_mentions(customer_code);
+"""
 
-def _connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
+
+def _is_pg() -> bool:
+    return bool(os.environ.get("DATABASE_URL", ""))
+
+
+def _pg_conn_str() -> str:
+    return os.environ["DATABASE_URL"]
+
+
+def _connect(db_path: Path = DB_PATH):
+    if _is_pg():
+        import psycopg2
+        return psycopg2.connect(_pg_conn_str())
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(db_path)
+    connection = __import__("sqlite3").connect(str(db_path))
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
 
 
+def _param(count: int = 1) -> str:
+    if _is_pg():
+        return ",".join("%s" for _ in range(count))
+    return ",".join("?" for _ in range(count))
+
+
+def _execute(conn, sql: str, params: list[Any] | tuple[Any, ...] | None = None) -> Any:
+    if _is_pg():
+        sql = sql.replace("?", "%s")
+    if params is None:
+        return conn.execute(sql)
+    return conn.execute(sql, params)
+
+
+def _table_columns(conn, table_name: str) -> set[str]:
+    if _is_pg():
+        rows = _execute(
+            conn,
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = %s",
+            [table_name],
+        ).fetchall()
+        return {row[0] for row in rows}
+    rows = _execute(conn, f"PRAGMA table_info({table_name})").fetchall()
+    return {row[1] for row in rows}
+
+
+def _init_schema(conn) -> None:
+    for statement in _SCHEMA_SQL.strip().split(";"):
+        stmt = statement.strip()
+        if stmt:
+            _execute(conn, stmt)
+
+
 def init_db(db_path: Path = DB_PATH) -> None:
     with _connect(db_path) as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS customers (
-                customer_code TEXT PRIMARY KEY,
-                customer_name TEXT,
-                branch TEXT,
-                getfly_url TEXT,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS crm_logs_v2 (
-                log_key TEXT PRIMARY KEY,
-                customer_code TEXT,
-                customer_name TEXT,
-                logged_at TEXT,
-                payload_json TEXT NOT NULL,
-                imported_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS financial_events (
-                event_id TEXT PRIMARY KEY,
-                log_key TEXT,
-                customer_code TEXT,
-                logged_at TEXT,
-                event_type TEXT,
-                amount_vnd REAL,
-                payload_json TEXT NOT NULL,
-                imported_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS service_inventory (
-                event_id TEXT PRIMARY KEY,
-                log_key TEXT,
-                customer_code TEXT,
-                logged_at TEXT,
-                profile_codes TEXT,
-                service_name TEXT,
-                payload_json TEXT NOT NULL,
-                imported_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS customer_mentions (
-                mention_id TEXT PRIMARY KEY,
-                log_key TEXT,
-                customer_code TEXT,
-                mentioned_customer_code TEXT,
-                role_in_log TEXT,
-                payload_json TEXT NOT NULL,
-                imported_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_crm_logs_v2_customer
-            ON crm_logs_v2(customer_code);
-
-            CREATE INDEX IF NOT EXISTS idx_financial_customer
-            ON financial_events(customer_code);
-
-            CREATE INDEX IF NOT EXISTS idx_inventory_customer
-            ON service_inventory(customer_code);
-
-            CREATE INDEX IF NOT EXISTS idx_mentions_customer
-            ON customer_mentions(customer_code);
-            """
-        )
+        _init_schema(conn)
 
 
 def _json_value(value: Any) -> Any:
@@ -116,22 +149,14 @@ def _row_payload(row: pd.Series) -> str:
     )
 
 
-def _delete_children_for_logs(conn: sqlite3.Connection, log_keys: list[str]) -> None:
+def _delete_children_for_logs(conn, log_keys: list[str]) -> None:
     if not log_keys:
         return
-    placeholders = ",".join("?" for _ in log_keys)
-    conn.execute(
-        f"DELETE FROM financial_events WHERE log_key IN ({placeholders})",
-        log_keys,
-    )
-    conn.execute(
-        f"DELETE FROM service_inventory WHERE log_key IN ({placeholders})",
-        log_keys,
-    )
-    conn.execute(
-        f"DELETE FROM customer_mentions WHERE log_key IN ({placeholders})",
-        log_keys,
-    )
+    placeholders = _param(len(log_keys))
+    for table in ("financial_events", "service_inventory", "customer_mentions"):
+        _execute(
+            conn, f"DELETE FROM {table} WHERE log_key IN ({placeholders})", log_keys
+        )
 
 
 def save_bundle(
@@ -166,7 +191,8 @@ def save_bundle(
     updated = 0
 
     with _connect(db_path) as conn:
-        conn.execute(
+        _execute(
+            conn,
             """
             INSERT INTO customers (
                 customer_code, customer_name, branch, getfly_url, updated_at
@@ -188,8 +214,9 @@ def save_bundle(
 
         existing_keys = {
             row[0]
-            for row in conn.execute(
-                f"SELECT log_key FROM crm_logs_v2 WHERE log_key IN ({','.join('?' for _ in log_keys)})",
+            for row in _execute(
+                conn,
+                f"SELECT log_key FROM crm_logs_v2 WHERE log_key IN ({_param(len(log_keys))})",
                 log_keys,
             ).fetchall()
         } if log_keys else set()
@@ -201,7 +228,8 @@ def save_bundle(
             logged_at = pd.to_datetime(
                 row.get("Thời gian ghi nhận"), errors="coerce"
             )
-            conn.execute(
+            _execute(
+                conn,
                 """
                 INSERT INTO crm_logs_v2 (
                     log_key, customer_code, customer_name, logged_at,
@@ -234,13 +262,22 @@ def save_bundle(
                     row.get("Thời gian ghi nhận"), errors="coerce"
                 )
                 amount = pd.to_numeric(row.get("Số tiền (VND)"), errors="coerce")
-                conn.execute(
+                _execute(
+                    conn,
                     """
-                    INSERT OR REPLACE INTO financial_events (
+                    INSERT INTO financial_events (
                         event_id, log_key, customer_code, logged_at,
                         event_type, amount_vnd, payload_json, imported_at
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(event_id) DO UPDATE SET
+                        log_key = excluded.log_key,
+                        customer_code = excluded.customer_code,
+                        logged_at = excluded.logged_at,
+                        event_type = excluded.event_type,
+                        amount_vnd = excluded.amount_vnd,
+                        payload_json = excluded.payload_json,
+                        imported_at = CURRENT_TIMESTAMP
                     """,
                     (
                         str(row.get("Financial event ID", "")),
@@ -258,13 +295,22 @@ def save_bundle(
                 logged_at = pd.to_datetime(
                     row.get("Thời gian ghi nhận"), errors="coerce"
                 )
-                conn.execute(
+                _execute(
+                    conn,
                     """
-                    INSERT OR REPLACE INTO service_inventory (
+                    INSERT INTO service_inventory (
                         event_id, log_key, customer_code, logged_at,
                         profile_codes, service_name, payload_json, imported_at
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(event_id) DO UPDATE SET
+                        log_key = excluded.log_key,
+                        customer_code = excluded.customer_code,
+                        logged_at = excluded.logged_at,
+                        profile_codes = excluded.profile_codes,
+                        service_name = excluded.service_name,
+                        payload_json = excluded.payload_json,
+                        imported_at = CURRENT_TIMESTAMP
                     """,
                     (
                         str(row.get("Inventory event ID", "")),
@@ -279,14 +325,22 @@ def save_bundle(
 
         if isinstance(mentions, pd.DataFrame):
             for _, row in mentions.iterrows():
-                conn.execute(
+                _execute(
+                    conn,
                     """
-                    INSERT OR REPLACE INTO customer_mentions (
+                    INSERT INTO customer_mentions (
                         mention_id, log_key, customer_code,
                         mentioned_customer_code, role_in_log,
                         payload_json, imported_at
                     )
                     VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(mention_id) DO UPDATE SET
+                        log_key = excluded.log_key,
+                        customer_code = excluded.customer_code,
+                        mentioned_customer_code = excluded.mentioned_customer_code,
+                        role_in_log = excluded.role_in_log,
+                        payload_json = excluded.payload_json,
+                        imported_at = CURRENT_TIMESTAMP
                     """,
                     (
                         str(row.get("Mention ID", "")),
@@ -312,17 +366,15 @@ def _load_json_rows(
     query = f"SELECT payload_json FROM {table_name}"
     params: list[Any] = []
     if customer_code:
-        query += " WHERE UPPER(customer_code) = ?"
+        query += f" WHERE UPPER(customer_code) = {_param()}"
         params.append(customer_code)
     with _connect(db_path) as conn:
-        table_columns = {
-            row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-        }
+        table_columns = _table_columns(conn, table_name)
         if "logged_at" in table_columns:
             query += " ORDER BY logged_at DESC"
-        query += " LIMIT ?"
+        query += f" LIMIT {_param()}"
         params.append(int(limit))
-        rows = conn.execute(query, params).fetchall()
+        rows = _execute(conn, query, params).fetchall()
 
     records = [json.loads(row[0]) for row in rows]
     frame = pd.DataFrame(records)
@@ -368,11 +420,11 @@ def delete_logs(log_keys: list[str], db_path: Path = DB_PATH) -> int:
     if not log_keys:
         return 0
     init_db(db_path)
-    placeholders = ",".join("?" for _ in log_keys)
     with _connect(db_path) as conn:
         _delete_children_for_logs(conn, log_keys)
-        conn.execute(
-            f"DELETE FROM crm_logs_v2 WHERE log_key IN ({placeholders})",
+        _execute(
+            conn,
+            f"DELETE FROM crm_logs_v2 WHERE log_key IN ({_param(len(log_keys))})",
             log_keys,
         )
     return len(log_keys)
@@ -383,15 +435,15 @@ def delete_all_data(db_path: Path = DB_PATH) -> dict[str, int]:
     counts = {}
     with _connect(db_path) as conn:
         for table in ["customer_mentions", "service_inventory", "financial_events", "crm_logs_v2", "customers"]:
-            counts[table] = conn.execute(f"DELETE FROM {table}").rowcount
+            counts[table] = _execute(conn, f"DELETE FROM {table}").rowcount
     return counts
 
 
 def database_stats(db_path: Path = DB_PATH) -> tuple[int, int, int, int]:
     init_db(db_path)
     with _connect(db_path) as conn:
-        customers = conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
-        logs = conn.execute("SELECT COUNT(*) FROM crm_logs_v2").fetchone()[0]
-        financial = conn.execute("SELECT COUNT(*) FROM financial_events").fetchone()[0]
-        inventory = conn.execute("SELECT COUNT(*) FROM service_inventory").fetchone()[0]
+        customers = _execute(conn, "SELECT COUNT(*) FROM customers").fetchone()[0]
+        logs = _execute(conn, "SELECT COUNT(*) FROM crm_logs_v2").fetchone()[0]
+        financial = _execute(conn, "SELECT COUNT(*) FROM financial_events").fetchone()[0]
+        inventory = _execute(conn, "SELECT COUNT(*) FROM service_inventory").fetchone()[0]
     return int(customers), int(logs), int(financial), int(inventory)
