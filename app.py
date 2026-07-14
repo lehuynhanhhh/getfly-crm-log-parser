@@ -108,7 +108,7 @@ def latest_balance(financial: pd.DataFrame, event_type: str) -> float | None:
     return float(latest.iloc[-1]["Số tiền (VND)"])
 
 
-st.title("Getfly CRM Log Parser")
+st.title("Getfly CRM Log")
 st.caption(
     "Paste CRM → nhận diện khách hàng chính → tách log, tiền, công nợ, hồ sơ HS và tồn dịch vụ."
 )
