@@ -159,10 +159,10 @@ with st.sidebar:
 
     st.divider()
     customer_count, log_count, financial_count, inventory_count = database_stats()
-    st.metric("Khách hàng đã lưu", customer_count)
-    st.metric("Log đã lưu", log_count)
-    st.metric("Sự kiện tài chính", financial_count)
-    st.metric("Dòng tồn dịch vụ", inventory_count)
+    st.metric("Khách hàng đã lưu", f"{customer_count:,}")
+    st.metric("Log đã lưu", f"{log_count:,}")
+    st.metric("Sự kiện tài chính", f"{financial_count:,}")
+    st.metric("Dòng tồn dịch vụ", f"{inventory_count:,}")
 
 
 tab_parse, tab_history, tab_guide = st.tabs(
@@ -305,7 +305,7 @@ with tab_parse:
                 num_rows="dynamic",
                 disabled=["Financial event ID", "Log key"],
                 column_config={
-                    "Số tiền (VND)": st.column_config.NumberColumn(format="%d"),
+                    "Số tiền (VND)": st.column_config.NumberColumn(format="%,.0f"),
                 },
                 key="financial_editor_v12",
             )
@@ -418,25 +418,23 @@ with tab_history:
     col_delete_sel, col_delete_all, _ = st.columns([1, 1, 2])
     with col_delete_sel:
         if st.button("Xoá dòng đã chọn", type="secondary", use_container_width=True):
-            selected = st.session_state.get("history_checked_rows", set())
-            if selected:
-                all_keys = []
-                for tab_idx, frame in enumerate(history_frames):
-                    if not frame.empty:
-                        id_col = ["Log key", "Log key", "Log key", "Log key"][tab_idx]
-                        if id_col in frame.columns:
-                            for row_idx in list(selected):
-                                if row_idx < len(frame):
-                                    all_keys.append(str(frame.iloc[row_idx].get(id_col, "")))
-                deleted = delete_logs([k for k in all_keys if k])
-                if deleted:
-                    st.success(f"Đã xoá {deleted} log và dữ liệu liên quan.")
-                    st.session_state["history_refresh"] = refresh_key + 1
-                    st.rerun()
-                else:
-                    st.warning("Không có dòng nào được chọn hoặc log key không hợp lệ.")
+            selected_by_tab = st.session_state.get("history_checked_rows", {})
+            all_keys = []
+            for tab_idx, frame in enumerate(history_frames):
+                tab_selected = selected_by_tab.get(tab_idx, set())
+                if tab_selected and not frame.empty:
+                    id_col = ["Log key", "Log key", "Log key", "Log key"][tab_idx]
+                    if id_col in frame.columns:
+                        for row_idx in tab_selected:
+                            if row_idx < len(frame):
+                                all_keys.append(str(frame.iloc[row_idx].get(id_col, "")))
+            deleted = delete_logs([k for k in all_keys if k])
+            if deleted:
+                st.success(f"Đã xoá {deleted} log và dữ liệu liên quan.")
+                st.session_state["history_refresh"] = refresh_key + 1
+                st.rerun()
             else:
-                st.warning("Vui lòng chọn ít nhất một dòng để xoá.")
+                st.warning("Không có dòng nào được chọn hoặc log key không hợp lệ.")
     with col_delete_all:
         if st.button("Xoá toàn bộ database", type="secondary", use_container_width=True):
             st.session_state["confirm_delete_all"] = True
@@ -480,7 +478,15 @@ with tab_history:
                     key=selection_key,
                 )
                 checked = set(edited[edited["Chọn"] == True].index)
-                st.session_state["history_checked_rows"] = checked
+                st.session_state[f"history_checked_{tab_idx}"] = checked
+
+    # Merge checked rows from all tabs into a dict {tab_idx: set}
+    checked_by_tab = {}
+    for i in range(4):
+        tab_set = st.session_state.get(f"history_checked_{i}", set())
+        if tab_set:
+            checked_by_tab[i] = tab_set
+    st.session_state["history_checked_rows"] = checked_by_tab
 
 
 with tab_guide:
