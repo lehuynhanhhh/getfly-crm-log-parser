@@ -448,6 +448,20 @@ def load_mentions(
     return _load_json_rows("customer_mentions", customer_code, limit, db_path)
 
 
+def load_customer_url(customer_code: str, db_path: Path = DB_PATH) -> str:
+    init_db(db_path)
+    customer_code = customer_code.strip().upper()
+    if not customer_code:
+        return ""
+    with _connect(db_path) as conn:
+        row = _execute(
+            conn,
+            "SELECT getfly_url FROM customers WHERE UPPER(customer_code) = ?",
+            (customer_code,),
+        ).fetchone()
+    return str(row[0]) if row else ""
+
+
 def delete_logs(log_keys: list[str], db_path: Path = DB_PATH) -> int:
     if not log_keys:
         return 0

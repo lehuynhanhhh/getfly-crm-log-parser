@@ -12,6 +12,7 @@ from database import (
     delete_all_data,
     delete_logs,
     init_db,
+    load_customer_url,
     load_financial_events,
     load_inventory,
     load_logs,
@@ -167,6 +168,54 @@ def latest_balance(financial: pd.DataFrame, event_type: str) -> float | None:
     if event_type in {"Số dư tài khoản tặng", "Số dư voucher"}:
         return float(latest["Số tiền (VND)"].sum())
     return float(latest.iloc[-1]["Số tiền (VND)"])
+
+
+def _column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    with st.expander("🔍 Lọc theo cột", expanded=False):
+        filters = {}
+        cols = st.columns(min(4, len(df.columns)))
+        for i, col in enumerate(df.columns):
+            with cols[i % len(cols)]:
+                series = df[col].dropna()
+                if series.empty:
+                    continue
+                dtype = series.dtype
+                if pd.api.types.is_numeric_dtype(dtype):
+                    min_v, max_v = float(series.min()), float(series.max())
+                    if min_v == max_v:
+                        st.text(f"{col}: {min_v:.0f}")
+                        continue
+                    filters[col] = st.slider(
+                        col, min_v, max_v, (min_v, max_v),
+                        key=f"flt_{key_prefix}_{i}",
+                    )
+                elif series.nunique() <= 20:
+                    options = sorted(series.unique().tolist())
+                    filters[col] = st.multiselect(
+                        col, options, default=options,
+                        key=f"flt_{key_prefix}_{i}",
+                    )
+                else:
+                    filters[col] = st.text_input(
+                        col, "",
+                        key=f"flt_{key_prefix}_{i}",
+                    ).strip().lower()
+    for col, fval in filters.items():
+        if fval is None:
+            continue
+        series = df[col].dropna()
+        if pd.api.types.is_numeric_dtype(series.dtype):
+            if isinstance(fval, (list, tuple)) and len(fval) == 2:
+                lo, hi = fval
+                df = df[df[col].between(lo, hi, inclusive="both")]
+        elif isinstance(fval, list):
+            if fval:
+                df = df[df[col].isin(fval)]
+        elif fval:
+            df = df[df[col].astype(str).str.lower().str.contains(fval, na=False)]
+    return df
 
 
 st.title("Getfly CRM Log")
@@ -340,8 +389,13 @@ with tab_parse:
         )
 
         with result_tabs[0]:
+            display_logs = logs.copy()
+            gurl = st.session_state.getfly_url
+            if gurl:
+                display_logs["Getfly URL"] = gurl
+            display_logs = _column_filters(display_logs, "p_logs")
             edited_logs = st.data_editor(
-                logs,
+                display_logs,
                 hide_index=True,
                 use_container_width=True,
                 height=560,
@@ -356,8 +410,9 @@ with tab_parse:
                 "Một log có thể tạo nhiều dòng tài chính: mua gói, thanh toán, nợ, "
                 "hoàn/back, số dư cọc, số dư tài khoản và tiền trừ."
             )
+            display_fin = _column_filters(financial, "p_fin")
             edited_financial = st.data_editor(
-                financial,
+                display_fin,
                 hide_index=True,
                 use_container_width=True,
                 height=560,
@@ -371,8 +426,9 @@ with tab_parse:
             bundle["financial_events"] = edited_financial
 
         with result_tabs[2]:
+            display_inv = _column_filters(inventory, "p_inv")
             edited_inventory = st.data_editor(
-                inventory,
+                display_inv,
                 hide_index=True,
                 use_container_width=True,
                 height=560,
@@ -383,8 +439,9 @@ with tab_parse:
             bundle["service_inventory"] = edited_inventory
 
         with result_tabs[3]:
+            display_ment = _column_filters(mentions, "p_ment")
             edited_mentions = st.data_editor(
-                mentions,
+                display_ment,
                 hide_index=True,
                 use_container_width=True,
                 height=520,
@@ -395,8 +452,9 @@ with tab_parse:
             bundle["customer_mentions"] = edited_mentions
 
         with result_tabs[4]:
+            display_cand = _column_filters(candidates, "p_cand")
             st.dataframe(
-                candidates,
+                display_cand,
                 hide_index=True,
                 use_container_width=True,
                 height=400,
@@ -521,27 +579,38 @@ with tab_history:
                 st.session_state["confirm_delete_all"] = False
                 st.rerun()
 
+    # Load Getfly URL if searching a specific customer
+    customer_url = load_customer_url(search_code) if search_code else ""
+
     for tab_idx, (history_tab, frame) in enumerate(zip(history_tabs, history_frames)):
         with history_tab:
             if frame.empty:
                 st.info("Chưa có dữ liệu phù hợp.")
             else:
                 frame = frame.reset_index(drop=True)
+                # Add Getfly URL column to CRM Log
+                if tab_idx == 0 and customer_url:
+                    frame["Getfly URL"] = customer_url
                 id_col = ["Log key", "Log key", "Log key", "Log key"][tab_idx]
                 frame_with_check = frame.copy()
                 frame_with_check.insert(0, "Chọn", False)
                 disabled_cols = [c for c in frame_with_check.columns if c != "Chọn"]
-                selection_key = f"history_select_{tab_idx}_{refresh_key}"
+                # Column-specific config
+                col_config = {
+                    "Chọn": st.column_config.CheckboxColumn("Chọn", default=False),
+                }
+                if tab_idx == 1 and "Số tiền (VND)" in frame_with_check.columns:
+                    col_config["Số tiền (VND)"] = st.column_config.NumberColumn(format="%,.0f")
+                # Apply column filters
+                filtered = _column_filters(frame_with_check, f"h_{tab_idx}")
                 edited = st.data_editor(
-                    frame_with_check,
-                    column_config={
-                        "Chọn": st.column_config.CheckboxColumn("Chọn", default=False),
-                    },
+                    filtered,
+                    column_config=col_config,
                     hide_index=True,
                     use_container_width=True,
                     height=540,
                     disabled=disabled_cols,
-                    key=selection_key,
+                    key=f"history_select_{tab_idx}_{refresh_key}",
                 )
                 checked = set(edited[edited["Chọn"] == True].index)
                 st.session_state[f"history_checked_{tab_idx}"] = checked
