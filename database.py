@@ -120,6 +120,7 @@ def _connect(db_path: Path = DB_PATH):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = __import__("sqlite3").connect(str(db_path))
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 10000")
     return connection
 
 
@@ -166,7 +167,6 @@ def init_db(db_path: Path = DB_PATH) -> None:
 
 
 def _migrate_users(conn) -> None:
-    cols = _table_columns(conn, "users")
     user_migrations = [
         ("role", "ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'"),
         ("display_name", "ALTER TABLE users ADD COLUMN display_name TEXT DEFAULT ''"),
@@ -177,8 +177,10 @@ def _migrate_users(conn) -> None:
         ("updated_at", "ALTER TABLE users ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP"),
     ]
     for col, sql in user_migrations:
-        if col not in cols:
+        try:
             _execute(conn, sql)
+        except Exception:
+            pass
 
 
 def seed_admin(db_path: Path = DB_PATH) -> None:
@@ -753,11 +755,13 @@ def update_user_role(email: str, new_role: str, db_path: Path = DB_PATH) -> bool
 
 
 def clean_expired_sessions(db_path: Path = DB_PATH) -> int:
-    init_db(db_path)
-    with _connect(db_path) as conn:
-        if _is_pg():
-            sql = "DELETE FROM auth_sessions WHERE expires_at < NOW()"
-        else:
-            sql = "DELETE FROM auth_sessions WHERE expires_at < datetime('now')"
-        result = _execute(conn, sql)
-        return result.rowcount if hasattr(result, "rowcount") else 0
+    try:
+        with _connect(db_path) as conn:
+            if _is_pg():
+                sql = "DELETE FROM auth_sessions WHERE expires_at < NOW()"
+            else:
+                sql = "DELETE FROM auth_sessions WHERE expires_at < datetime('now')"
+            result = _execute(conn, sql)
+            return result.rowcount if hasattr(result, "rowcount") else 0
+    except Exception:
+        return 0
