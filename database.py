@@ -1,17 +1,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping
 
 import pandas as pd
 
-
-DB_PATH = Path("data/crm_logs.db")
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "data" / "crm_logs.db"
 
 TABLE_MAP = {
     "logs": "crm_logs_v2",
@@ -42,7 +45,7 @@ CREATE TABLE IF NOT EXISTS financial_events (
     customer_code TEXT,
     logged_at TEXT,
     event_type TEXT,
-    amount_vnd REAL,
+    amount_vnd INTEGER,
     payload_json TEXT NOT NULL,
     imported_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
@@ -102,21 +105,69 @@ CREATE TABLE IF NOT EXISTS auth_audit_log (
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_email ON auth_sessions(email);
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_auth_audit_email ON auth_audit_log(email);
+CREATE TABLE IF NOT EXISTS save_batches (
+    batch_id TEXT PRIMARY KEY,
+    primary_customer_code TEXT,
+    source_hash TEXT,
+    source_log_count INTEGER DEFAULT 0,
+    source_financial_count INTEGER DEFAULT 0,
+    source_inventory_count INTEGER DEFAULT 0,
+    source_mention_count INTEGER DEFAULT 0,
+    created_by TEXT DEFAULT '',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    committed_at TEXT,
+    status TEXT DEFAULT 'processing',
+    error_message TEXT
+);
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version TEXT PRIMARY KEY,
+    applied_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
+def _get_db_url() -> str:
+    return os.environ.get("DATABASE_URL", "").strip()
+
+
 def _is_pg() -> bool:
-    return bool(os.environ.get("DATABASE_URL", ""))
+    return _get_db_url().startswith("postgresql://") or _get_db_url().startswith("postgres://")
+
+
+def _is_production() -> bool:
+    return bool(os.environ.get("STREAMLIT_RUNTIME_API_SERVER_URL", "")) or \
+           bool(os.environ.get("STREAMLIT_SHARING", ""))
+
+
+def validate_db_config() -> None:
+    url = _get_db_url()
+    if _is_production():
+        if not url:
+            msg = (
+                "⚠️ **Production database chưa được cấu hình.**\n\n"
+                "Chức năng lưu dữ liệu đang bị vô hiệu hóa để tránh mất dữ liệu.\n\n"
+                "Vui lòng cấu hình `DATABASE_URL` trong Streamlit Secrets:\n"
+                "  DATABASE_URL = \"postgresql://user:password@host:5432/dbname\"\n\n"
+                "Sau khi cấu hình, hãy khởi động lại ứng dụng."
+            )
+            raise RuntimeError(msg)
+        if not _is_pg():
+            raise RuntimeError(
+                "DATABASE_URL phải bắt đầu bằng `postgresql://` hoặc `postgres://`.\n"
+                f"Giá trị hiện tại: {url[:15]}..."
+            )
 
 
 def _pg_conn_str() -> str:
-    return os.environ["DATABASE_URL"]
+    return _get_db_url()
 
 
 def _connect(db_path: Path = DB_PATH):
     if _is_pg():
         import psycopg2
-        return psycopg2.connect(_pg_conn_str())
+        conn = psycopg2.connect(_pg_conn_str())
+        conn.autocommit = True
+        return conn
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = __import__("sqlite3").connect(str(db_path))
     connection.execute("PRAGMA foreign_keys = ON")
@@ -159,8 +210,10 @@ def _init_schema(conn) -> None:
 
 
 def init_db(db_path: Path = DB_PATH) -> None:
+    validate_db_config()
     with _connect(db_path) as conn:
         _init_schema(conn)
+        _run_migrations(conn, db_path)
         _migrate_users(conn)
         _seed_admin(conn)
     clean_expired_sessions(db_path)
@@ -199,6 +252,62 @@ def _seed_admin(conn) -> None:
             "INSERT INTO users (email, password_hash, role, display_name) VALUES (?, ?, ?, ?)",
             ("admin@driphydration.vn", pw_hash, "admin", "Admin"),
         )
+
+
+def _backup_db(db_path: Path, version: str) -> Path | None:
+    if _is_pg() or not db_path.exists():
+        return None
+    backup_dir = db_path.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = backup_dir / f"crm_logs_{timestamp}_{version}.db"
+    shutil.copy2(str(db_path), str(backup_path))
+    return backup_path
+
+
+def _run_migrations(conn, db_path: Path) -> None:
+    applied = {row[0] for row in _execute(
+        conn, "SELECT version FROM schema_migrations"
+    ).fetchall()} if _table_columns(conn, "schema_migrations") >= {"version"} else set()
+
+    migrations = [
+        ("V001__money_to_bigint", _migrate_v001_money_to_bigint),
+    ]
+    for version, fn in migrations:
+        if version not in applied:
+            _backup_db(db_path, version)
+            fn(conn)
+            _execute(conn, "INSERT INTO schema_migrations (version) VALUES (?)", (version,))
+
+
+def _migrate_v001_money_to_bigint(conn) -> None:
+    if _is_pg():
+        _execute(conn,
+            "ALTER TABLE financial_events ALTER COLUMN amount_vnd TYPE BIGINT USING amount_vnd::bigint")
+    else:
+        _execute(conn, "PRAGMA foreign_keys = OFF")
+        _execute(conn, """
+            CREATE TABLE financial_events_v2 (
+                event_id TEXT PRIMARY KEY,
+                log_key TEXT,
+                customer_code TEXT,
+                logged_at TEXT,
+                event_type TEXT,
+                amount_vnd INTEGER,
+                payload_json TEXT NOT NULL,
+                imported_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        _execute(conn, """
+            INSERT INTO financial_events_v2
+            SELECT event_id, log_key, customer_code, logged_at, event_type,
+                   CAST(CAST(amount_vnd AS REAL) AS INTEGER), payload_json, imported_at
+            FROM financial_events
+        """)
+        _execute(conn, "DROP TABLE financial_events")
+        _execute(conn, "ALTER TABLE financial_events_v2 RENAME TO financial_events")
+        _execute(conn, "CREATE INDEX IF NOT EXISTS idx_financial_customer ON financial_events(customer_code)")
+        _execute(conn, "PRAGMA foreign_keys = ON")
 
 
 def _json_value(value: Any) -> Any:
@@ -427,6 +536,251 @@ def save_bundle(
                 )
 
     return inserted, updated
+
+
+@dataclass
+class SaveResult:
+    batch_id: str = ""
+    customer_upserted: bool = False
+    crm_logs_inserted: int = 0
+    crm_logs_updated: int = 0
+    financial_inserted: int = 0
+    financial_updated: int = 0
+    inventory_inserted: int = 0
+    inventory_updated: int = 0
+    mentions_inserted: int = 0
+    mentions_updated: int = 0
+    committed: bool = False
+    error_message: str = ""
+
+
+def save_parse_result(
+    bundle: Mapping[str, Any],
+    metadata: Mapping[str, str],
+    created_by: str = "",
+    db_path: Path = DB_PATH,
+) -> SaveResult:
+    validate_db_config()
+    init_db(db_path)
+    result = SaveResult()
+
+    logs = bundle.get("logs", pd.DataFrame())
+    financial = bundle.get("financial_events", pd.DataFrame())
+    inventory = bundle.get("service_inventory", pd.DataFrame())
+    mentions = bundle.get("customer_mentions", pd.DataFrame())
+
+    if not isinstance(logs, pd.DataFrame) or logs.empty:
+        result.error_message = "No logs to save."
+        return result
+
+    customer_code = str(
+        metadata.get("customer_code")
+        or logs.iloc[0].get("Mã KH chính", "")
+    ).strip().upper()
+    customer_name = str(
+        metadata.get("customer_name")
+        or logs.iloc[0].get("Tên khách hàng chính", "")
+    ).strip()
+
+    if not customer_code:
+        result.error_message = "Cần có Mã khách hàng chính trước khi lưu database."
+        return result
+
+    log_keys = logs["Log key"].astype(str).tolist()
+    source_hash = hashlib.sha256(
+        str(bundle.get("raw_text", "")).encode("utf-8")
+    ).hexdigest()[:16]
+
+    conn = _connect(db_path)
+    try:
+        if _is_pg():
+            conn.autocommit = False
+        else:
+            _execute(conn, "BEGIN")
+
+        batch_id = uuid.uuid4().hex
+        _execute(conn, """
+            INSERT INTO save_batches (batch_id, primary_customer_code, source_hash,
+                source_log_count, source_financial_count, source_inventory_count,
+                source_mention_count, created_by, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'processing')
+        """, (batch_id, customer_code, source_hash,
+              len(logs), len(financial), len(inventory), len(mentions), created_by))
+
+        _execute(conn, """
+            INSERT INTO customers (customer_code, customer_name, branch, getfly_url, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(customer_code) DO UPDATE SET
+                customer_name = excluded.customer_name,
+                branch = excluded.branch,
+                getfly_url = excluded.getfly_url,
+                updated_at = CURRENT_TIMESTAMP
+        """, (customer_code, customer_name,
+              str(metadata.get("branch", "")),
+              str(metadata.get("getfly_url", ""))))
+        result.customer_upserted = True
+
+        for _, row in logs.iterrows():
+            log_key = str(row.get("Log key", ""))
+            logged_at = pd.to_datetime(row.get("Thời gian ghi nhận"), errors="coerce")
+            existing = _execute(conn,
+                "SELECT 1 FROM crm_logs_v2 WHERE log_key = ?", (log_key,)
+            ).fetchone()
+            _execute(conn, """
+                INSERT INTO crm_logs_v2 (log_key, customer_code, customer_name, logged_at, payload_json, imported_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(log_key) DO UPDATE SET
+                    customer_code = excluded.customer_code,
+                    customer_name = excluded.customer_name,
+                    logged_at = excluded.logged_at,
+                    payload_json = excluded.payload_json,
+                    imported_at = CURRENT_TIMESTAMP
+            """, (log_key, customer_code, customer_name,
+                  None if pd.isna(logged_at) else logged_at.isoformat(),
+                  _row_payload(row)))
+            if existing:
+                result.crm_logs_updated += 1
+            else:
+                result.crm_logs_inserted += 1
+
+        if isinstance(financial, pd.DataFrame) and not financial.empty:
+            for _, row in financial.iterrows():
+                logged_at = pd.to_datetime(row.get("Thời gian ghi nhận"), errors="coerce")
+                amount_val = pd.to_numeric(row.get("Số tiền (VND)"), errors="coerce")
+                amount_int = int(amount_val) if pd.notna(amount_val) else None
+                event_id = str(row.get("Financial event ID", ""))
+                existing = _execute(conn,
+                    "SELECT 1 FROM financial_events WHERE event_id = ?", (event_id,)
+                ).fetchone()
+                _execute(conn, """
+                    INSERT INTO financial_events (event_id, log_key, customer_code, logged_at,
+                        event_type, amount_vnd, payload_json, imported_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(event_id) DO UPDATE SET
+                        log_key = excluded.log_key, customer_code = excluded.customer_code,
+                        logged_at = excluded.logged_at, event_type = excluded.event_type,
+                        amount_vnd = excluded.amount_vnd, payload_json = excluded.payload_json,
+                        imported_at = CURRENT_TIMESTAMP
+                """, (event_id, str(row.get("Log key", "")), customer_code,
+                      None if pd.isna(logged_at) else logged_at.isoformat(),
+                      str(row.get("Loại sự kiện tài chính", "")),
+                      amount_int, _row_payload(row)))
+                if existing:
+                    result.financial_updated += 1
+                else:
+                    result.financial_inserted += 1
+
+        if isinstance(inventory, pd.DataFrame) and not inventory.empty:
+            for _, row in inventory.iterrows():
+                logged_at = pd.to_datetime(row.get("Thời gian ghi nhận"), errors="coerce")
+                event_id = str(row.get("Inventory event ID", ""))
+                existing = _execute(conn,
+                    "SELECT 1 FROM service_inventory WHERE event_id = ?", (event_id,)
+                ).fetchone()
+                _execute(conn, """
+                    INSERT INTO service_inventory (event_id, log_key, customer_code, logged_at,
+                        profile_codes, service_name, payload_json, imported_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(event_id) DO UPDATE SET
+                        log_key = excluded.log_key, customer_code = excluded.customer_code,
+                        logged_at = excluded.logged_at,
+                        profile_codes = excluded.profile_codes,
+                        service_name = excluded.service_name,
+                        payload_json = excluded.payload_json,
+                        imported_at = CURRENT_TIMESTAMP
+                """, (event_id, str(row.get("Log key", "")), customer_code,
+                      None if pd.isna(logged_at) else logged_at.isoformat(),
+                      str(row.get("Mã hồ sơ HS", "")),
+                      str(row.get("Dịch vụ/Gói còn lại", "")),
+                      _row_payload(row)))
+                if existing:
+                    result.inventory_updated += 1
+                else:
+                    result.inventory_inserted += 1
+
+        if isinstance(mentions, pd.DataFrame) and not mentions.empty:
+            for _, row in mentions.iterrows():
+                mention_id = str(row.get("Mention ID", ""))
+                existing = _execute(conn,
+                    "SELECT 1 FROM customer_mentions WHERE mention_id = ?", (mention_id,)
+                ).fetchone()
+                _execute(conn, """
+                    INSERT INTO customer_mentions (mention_id, log_key, customer_code,
+                        mentioned_customer_code, role_in_log, payload_json, imported_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(mention_id) DO UPDATE SET
+                        log_key = excluded.log_key, customer_code = excluded.customer_code,
+                        mentioned_customer_code = excluded.mentioned_customer_code,
+                        role_in_log = excluded.role_in_log,
+                        payload_json = excluded.payload_json,
+                        imported_at = CURRENT_TIMESTAMP
+                """, (mention_id, str(row.get("Log key", "")), customer_code,
+                      str(row.get("Mã KH được nhắc", "")),
+                      str(row.get("Vai trò trong log", "")),
+                      _row_payload(row)))
+                if existing:
+                    result.mentions_updated += 1
+                else:
+                    result.mentions_inserted += 1
+
+        _execute(conn,
+            "UPDATE save_batches SET status = 'committed', committed_at = CURRENT_TIMESTAMP WHERE batch_id = ?",
+            (batch_id,))
+        result.batch_id = batch_id
+
+        if _is_pg():
+            conn.commit()
+        else:
+            _execute(conn, "COMMIT")
+        result.committed = True
+
+    except Exception as e:
+        try:
+            if _is_pg():
+                conn.rollback()
+            else:
+                _execute(conn, "ROLLBACK")
+            _execute(conn,
+                "UPDATE save_batches SET status = 'failed', error_message = ? WHERE batch_id = ?",
+                (str(e), batch_id))
+        except Exception:
+            pass
+        result.committed = False
+        result.error_message = str(e)
+    finally:
+        conn.close()
+
+    return result
+
+
+def load_customer_bundle(
+    customer_code: str = "",
+    limit: int = 10000,
+    db_path: Path = DB_PATH,
+) -> dict:
+    validate_db_config()
+    kwargs = {"limit": limit, "db_path": db_path}
+    return {
+        "customer": _load_customer(customer_code, db_path),
+        "logs": load_logs(customer_code, **kwargs),
+        "financial_events": load_financial_events(customer_code, **kwargs),
+        "service_inventory": load_inventory(customer_code, **kwargs),
+        "customer_mentions": load_mentions(customer_code, **kwargs),
+    }
+
+
+def _load_customer(customer_code: str, db_path: Path) -> dict | None:
+    customer_code = customer_code.strip().upper()
+    if not customer_code:
+        return None
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = _execute(conn,
+            "SELECT customer_code, customer_name, branch, getfly_url, updated_at FROM customers WHERE UPPER(customer_code) = ?",
+            (customer_code,)).fetchone()
+    if not row:
+        return None
+    return dict(zip(["customer_code", "customer_name", "branch", "getfly_url", "updated_at"], row))
 
 
 def _load_json_rows(

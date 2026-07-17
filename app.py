@@ -4,11 +4,13 @@ from __future__ import annotations
 import sys
 import time
 from datetime import datetime
+from typing import Any
 
 
 # ── Test mode ──
 if "--test" in sys.argv:
     import os
+    import numpy as np
     import pandas as pd
 
     def _infer_filter_type(col, series):
@@ -60,6 +62,134 @@ if "--test" in sys.argv:
     check(all(pd.isna(_clean(pd.Series(["abc"])))), "abc -> NaN")
 
     total = 14
+
+    # ── Persistence tests ──
+    import gc
+    import tempfile
+    from pathlib import Path
+    from database import (
+        DB_PATH,
+        _connect,
+        _execute,
+        init_db,
+        load_customer_bundle,
+        save_parse_result,
+    )
+
+    def _assert_persist(cond, msg):
+        global errors
+        if not cond:
+            print(f"  FAIL: {msg}", flush=True)
+            errors += 1
+        else:
+            print(f"  OK:   {msg}", flush=True)
+
+    # Use a temp DB so we don't pollute the real one
+    tmp = Path(tempfile.mktemp(suffix=".db"))
+    old_db_path = DB_PATH
+    # Monkey-patch DB_PATH for test scope
+    import database as _db_mod
+    _db_mod.DB_PATH = tmp
+
+    init_db()
+
+    # 1. Basic persistence
+    bundle1 = {
+        "logs": pd.DataFrame({
+            "Log key": ["k1", "k2"],
+            "Mã KH chính": ["KH001", "KH001"],
+            "Thời gian ghi nhận": ["2026-07-14 10:00", "2026-07-14 10:01"],
+            "Tên khách hàng chính": ["Test A", "Test A"],
+            "STT": [1, 2],
+        }),
+        "financial_events": pd.DataFrame({
+            "Financial event ID": ["f1"],
+            "Log key": ["k1"],
+            "Loại sự kiện tài chính": ["TT"],
+            "Số tiền (VND)": [1500000],
+            "Thời gian ghi nhận": ["2026-07-14 10:00"],
+        }),
+        "service_inventory": pd.DataFrame(),
+        "customer_mentions": pd.DataFrame(),
+    }
+    meta1 = {"customer_code": "KH001", "customer_name": "Test A"}
+    r1 = save_parse_result(bundle1, meta1, db_path=tmp)
+    _assert_persist(r1.committed, "P1: save committed (fresh)")
+
+    # 2. F5 / restart simulation (new connection)
+    loaded = load_customer_bundle("KH001", db_path=tmp)
+    _assert_persist(len(loaded["logs"]) == 2, "P2: 2 logs survive after restart sim")
+    _assert_persist(len(loaded["financial_events"]) == 1, "P3: 1 financial event survives")
+
+    # 3. Idempotency (re-save same data)
+    r2 = save_parse_result(bundle1, meta1, db_path=tmp)
+    _assert_persist(r2.committed, "P4: idempotent save committed")
+    loaded2 = load_customer_bundle("KH001", db_path=tmp)
+    _assert_persist(len(loaded2["logs"]) == 2, "P5: still 2 logs after idempotent save")
+
+    # 4. Partial update (new log added)
+    bundle2 = {
+        "logs": pd.DataFrame({
+            "Log key": ["k1", "k2", "k3"],
+            "Mã KH chính": ["KH001", "KH001", "KH001"],
+            "Thời gian ghi nhận": ["2026-07-14 10:00", "2026-07-14 10:01", "2026-07-14 10:02"],
+            "Tên khách hàng chính": ["Test A", "Test A", "Test A"],
+            "STT": [1, 2, 3],
+        }),
+        "financial_events": pd.DataFrame({
+            "Financial event ID": ["f1", "f2"],
+            "Log key": ["k1", "k3"],
+            "Loại sự kiện tài chính": ["TT", "CK"],
+            "Số tiền (VND)": [1500000, 2000000],
+            "Thời gian ghi nhận": ["2026-07-14 10:00", "2026-07-14 10:02"],
+        }),
+        "service_inventory": pd.DataFrame(),
+        "customer_mentions": pd.DataFrame(),
+    }
+    r3 = save_parse_result(bundle2, meta1, db_path=tmp)
+    _assert_persist(r3.committed, "P6: partial update committed")
+    loaded3 = load_customer_bundle("KH001", db_path=tmp)
+    _assert_persist(len(loaded3["logs"]) == 3, "P7: 3 logs after adding new log")
+    _assert_persist(len(loaded3["financial_events"]) == 2, "P8: 2 financial events after adding new")
+
+    # 5. Money is INTEGER (BIGINT)
+    fin = loaded3["financial_events"]
+    money_vals = fin["Số tiền (VND)"].tolist()
+    _assert_persist(all(isinstance(v, (int, np.integer)) for v in money_vals), "P9: money column is int type")
+    _assert_persist(set(money_vals) == {1500000, 2000000}, "P10: money values match originals")
+
+    # 6. Identifier column is TEXT
+    _assert_persist(isinstance(loaded3["logs"]["Log key"].iloc[0], str), "P11: Log key is TEXT")
+
+    # 7. Empty data (no logs to save)
+    empty_bundle = {
+        "logs": pd.DataFrame(),
+        "financial_events": pd.DataFrame(),
+        "service_inventory": pd.DataFrame(),
+        "customer_mentions": pd.DataFrame(),
+    }
+    r4 = save_parse_result(empty_bundle, meta1, db_path=tmp)
+    _assert_persist(not r4.committed and r4.error_message == "No logs to save.", "P12: empty bundle rejected")
+
+    # 8. Schema migration record
+    conn = _connect(tmp)
+    mig_rows = _execute(conn, "SELECT version FROM schema_migrations").fetchall()
+    conn.close()
+    _assert_persist(len(mig_rows) >= 1, "P13: schema_migrations has records")
+    _assert_persist(any("V001" in r[0] for r in mig_rows), "P14: V001 migration recorded")
+
+    # Cleanup
+    import gc
+    try:
+        conn.close()
+    except NameError:
+        pass
+    gc.collect()
+    if tmp.exists():
+        tmp.unlink(missing_ok=True)
+    _db_mod.DB_PATH = old_db_path
+
+    total += 13
     passed = total - errors
     print(f"\n{'-' * 40}\nPassed: {passed}/{total}", flush=True)
     os._exit(0 if errors == 0 else 1)
@@ -75,6 +205,8 @@ from database import (
     delete_logs,
     get_user_by_email,
     init_db,
+    list_users,
+    load_customer_bundle,
     load_customer_url,
     load_financial_events,
     load_inventory,
@@ -82,10 +214,15 @@ from database import (
     load_mentions,
     register_user,
     revoke_session,
-    save_bundle,
+    save_parse_result,
+    SaveResult,
     seed_admin,
+    validate_db_config,
     validate_session,
     verify_user,
+    _get_db_url,
+    _is_production,
+    _is_pg,
 )
 from excel_export import build_excel_bytes
 
@@ -268,6 +405,15 @@ if st.sidebar.button("🚪 Đăng xuất"):
 
 init_db()
 
+if _is_production() and not _get_db_url():
+    st.sidebar.error(
+        "⚠️ **Chế độ production nhưng thiếu DATABASE_URL**\n\n"
+        "Cấu hình trong Streamlit Secrets:\n"
+        "`DATABASE_URL = \"postgresql://...\"`\n\n"
+        "Dữ liệu sẽ KHÔNG được lưu khi thiếu cấu hình này.",
+        icon="🚨",
+    )
+
 st.session_state.setdefault("crm_bundle", None)
 st.session_state.setdefault("raw_text", "")
 st.session_state.setdefault("status_mapping", DEFAULT_STATUS_MAPPING.copy())
@@ -280,6 +426,51 @@ def vnd(value: object) -> str:
     if pd.isna(number):
         return "—"
     return f"{float(number):,.0f} ₫".replace(",", ".")
+
+
+def _show_db_diagnostics() -> None:
+    import os
+    from pathlib import Path
+    from database import DB_PATH, _connect, _execute, _get_db_url, _is_production, _is_pg
+
+    env = "🏭 Production" if _is_production() else "💻 Local"
+    backend = "🐘 PostgreSQL" if _is_pg() else "🗄️ SQLite"
+    url = _get_db_url()
+    masked_url = url[:url.find("://") + 3] + "*****" if url else "—"
+    db_path = DB_PATH
+
+    st.markdown(f"**Environment:** {env}")
+    st.markdown(f"**Backend:** {backend}")
+    st.markdown(f"**Database URL:** `{masked_url}`")
+
+    if _is_pg():
+        return
+
+    st.markdown(f"**File:** `{db_path}`")
+    st.markdown(f"**Exists:** {db_path.exists()}")
+    if db_path.exists():
+        st.markdown(f"**Size:** {db_path.stat().st_size / 1024:.1f} KB")
+    backup_dir = db_path.parent / "backups"
+    if backup_dir.exists():
+        backups = sorted(backup_dir.glob("*.db"))
+        st.markdown(f"**Backups:** {len(backups)} ({backups[-1].name if backups else '—'})")
+
+    st.divider()
+    try:
+        conn = _connect(db_path)
+        rows = _execute(conn, "SELECT version FROM schema_migrations ORDER BY version").fetchall()
+        st.markdown(f"**Migrations:** {', '.join(r[0] for r in rows) if rows else 'None'}")
+        conn.close()
+    except Exception:
+        st.markdown("**Migrations:** Error reading")
+
+    st.divider()
+    c, l, f, i = database_stats()
+    st.markdown(f"**Customers:** {c}")
+    st.markdown(f"**CRM Logs:** {l}")
+    st.markdown(f"**Financial Events:** {f}")
+    st.markdown(f"**Service Inventory:** {i}")
+    st.markdown(f"**Auth Users:** {len(list_users())}")
 
 
 def latest_balance(financial: pd.DataFrame, event_type: str) -> float | None:
@@ -564,6 +755,10 @@ with st.sidebar:
     st.metric("Sự kiện tài chính", f"{financial_count:,}")
     st.metric("Dòng tồn dịch vụ", f"{inventory_count:,}")
 
+    if st.session_state.get("user_role") == "admin":
+        with st.expander("🛠️ Database Diagnostics", expanded=False):
+            _show_db_diagnostics()
+
 
 tab_parse, tab_history, tab_guide = st.tabs(
     ["1. Paste & xử lý", "2. Dữ liệu đã lưu", "3. Hướng dẫn"]
@@ -781,16 +976,39 @@ with tab_parse:
             )
 
         with a2:
-            if st.button(
+            disabled_save = _is_production() and not _get_db_url()
+            save_btn = st.button(
                 "Lưu vào database",
                 use_container_width=True,
                 type="primary",
-            ):
+                disabled=disabled_save,
+            )
+            if disabled_save:
+                st.caption("🔒 Cần cấu hình DATABASE_URL")
+            if save_btn:
                 try:
-                    inserted, updated = save_bundle(bundle, metadata)
-                    st.success(
-                        f"Đã thêm {inserted} log mới và cập nhật {updated} log đã tồn tại."
-                    )
+                    user_email = st.session_state.get("user_email", "")
+                    save_result = save_parse_result(bundle, metadata, created_by=user_email)
+                    if save_result.committed:
+                        # load-after-save validation
+                        persisted = load_customer_bundle(metadata["customer_code"])
+                        expected_logs = len(bundle["logs"])
+                        actual_logs = len(persisted["logs"])
+                        msg = (
+                            f"✅ Đã lưu: {save_result.crm_logs_inserted} log mới, "
+                            f"{save_result.crm_logs_updated} log cập nhật, "
+                            f"{save_result.financial_inserted} sự kiện tài chính."
+                        )
+                        if actual_logs < expected_logs:
+                            msg += (
+                                f"\n⚠️ Chỉ đọc lại được {actual_logs}/{expected_logs} log từ database. "
+                                f"Một số dữ liệu có thể chưa được lưu."
+                            )
+                        st.success(msg)
+                        st.session_state["last_saved_customer"] = metadata["customer_code"]
+                        st.session_state["last_save_batch"] = save_result.batch_id
+                    else:
+                        st.error(f"❌ Lưu thất bại: {save_result.error_message}")
                 except ValueError as exc:
                     st.error(str(exc))
 
