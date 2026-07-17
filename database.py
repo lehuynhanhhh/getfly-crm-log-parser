@@ -7,7 +7,7 @@ import os
 import shutil
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -15,6 +15,8 @@ import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data" / "crm_logs.db"
+
+PUBLIC_ACTOR = "public_user"
 
 TABLE_MAP = {
     "logs": "crm_logs_v2",
@@ -72,39 +74,6 @@ CREATE INDEX IF NOT EXISTS idx_crm_logs_v2_customer ON crm_logs_v2(customer_code
 CREATE INDEX IF NOT EXISTS idx_financial_customer ON financial_events(customer_code);
 CREATE INDEX IF NOT EXISTS idx_inventory_customer ON service_inventory(customer_code);
 CREATE INDEX IF NOT EXISTS idx_mentions_customer ON customer_mentions(customer_code);
-CREATE TABLE IF NOT EXISTS users (
-    email TEXT PRIMARY KEY,
-    password_hash TEXT NOT NULL,
-    role TEXT DEFAULT 'user',
-    display_name TEXT DEFAULT '',
-    is_active INTEGER DEFAULT 1,
-    failed_login_count INTEGER DEFAULT 0,
-    locked_until TEXT,
-    password_changed_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS auth_sessions (
-    session_id TEXT PRIMARY KEY,
-    email TEXT NOT NULL,
-    role TEXT NOT NULL,
-    ip_address TEXT DEFAULT '',
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    expires_at TEXT NOT NULL,
-    last_activity TEXT DEFAULT CURRENT_TIMESTAMP,
-    is_revoked INTEGER DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS auth_audit_log (
-    id TEXT PRIMARY KEY,
-    email TEXT,
-    action TEXT,
-    details TEXT,
-    ip_address TEXT DEFAULT '',
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_auth_sessions_email ON auth_sessions(email);
-CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at);
-CREATE INDEX IF NOT EXISTS idx_auth_audit_email ON auth_audit_log(email);
 CREATE TABLE IF NOT EXISTS save_batches (
     batch_id TEXT PRIMARY KEY,
     primary_customer_code TEXT,
@@ -214,44 +183,6 @@ def init_db(db_path: Path = DB_PATH) -> None:
     with _connect(db_path) as conn:
         _init_schema(conn)
         _run_migrations(conn, db_path)
-        _migrate_users(conn)
-        _seed_admin(conn)
-    clean_expired_sessions(db_path)
-
-
-def _migrate_users(conn) -> None:
-    user_migrations = [
-        ("role", "ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'"),
-        ("display_name", "ALTER TABLE users ADD COLUMN display_name TEXT DEFAULT ''"),
-        ("is_active", "ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1"),
-        ("failed_login_count", "ALTER TABLE users ADD COLUMN failed_login_count INTEGER DEFAULT 0"),
-        ("locked_until", "ALTER TABLE users ADD COLUMN locked_until TEXT"),
-        ("password_changed_at", "ALTER TABLE users ADD COLUMN password_changed_at TEXT DEFAULT CURRENT_TIMESTAMP"),
-        ("updated_at", "ALTER TABLE users ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP"),
-    ]
-    for col, sql in user_migrations:
-        try:
-            _execute(conn, sql)
-        except Exception:
-            pass
-
-
-def seed_admin(db_path: Path = DB_PATH) -> None:
-    init_db(db_path)
-
-
-def _seed_admin(conn) -> None:
-    import bcrypt
-    exists = _execute(
-        conn, "SELECT 1 FROM users WHERE email = ?", ("admin@driphydration.vn",)
-    ).fetchone()
-    if not exists:
-        pw_hash = bcrypt.hashpw(b"Financeteam@123", bcrypt.gensalt()).decode()
-        _execute(
-            conn,
-            "INSERT INTO users (email, password_hash, role, display_name) VALUES (?, ?, ?, ?)",
-            ("admin@driphydration.vn", pw_hash, "admin", "Admin"),
-        )
 
 
 def _backup_db(db_path: Path, version: str) -> Path | None:
@@ -557,7 +488,7 @@ class SaveResult:
 def save_parse_result(
     bundle: Mapping[str, Any],
     metadata: Mapping[str, str],
-    created_by: str = "",
+    created_by: str = PUBLIC_ACTOR,
     db_path: Path = DB_PATH,
 ) -> SaveResult:
     validate_db_config()
@@ -889,233 +820,3 @@ def database_stats(db_path: Path = DB_PATH) -> tuple[int, int, int, int]:
         financial = _execute(conn, "SELECT COUNT(*) FROM financial_events").fetchone()[0]
         inventory = _execute(conn, "SELECT COUNT(*) FROM service_inventory").fetchone()[0]
     return int(customers), int(logs), int(financial), int(inventory)
-
-
-def register_user(
-    email: str, password: str, role: str = "user", display_name: str = "",
-    db_path: Path = DB_PATH,
-) -> bool:
-    import bcrypt
-    init_db(db_path)
-    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-    with _connect(db_path) as conn:
-        try:
-            _execute(
-                conn,
-                "INSERT INTO users (email, password_hash, role, display_name) VALUES (?, ?, ?, ?)",
-                (email, password_hash, role, display_name),
-            )
-            return True
-        except Exception:
-            return False
-
-
-def verify_user(email: str, password: str, db_path: Path = DB_PATH) -> tuple[bool, str]:
-    import bcrypt
-    init_db(db_path)
-    with _connect(db_path) as conn:
-        row = _execute(
-            conn,
-            "SELECT password_hash, role, is_active, failed_login_count, locked_until FROM users WHERE email = ?",
-            (email,),
-        ).fetchone()
-    if row is None:
-        return False, ""
-
-    pw_hash, role, is_active, failed_count, locked_until = row
-
-    if not is_active:
-        return False, ""
-
-    if locked_until:
-        try:
-            locked_dt = datetime.fromisoformat(locked_until)
-            if datetime.utcnow() < locked_dt:
-                return False, ""
-        except (ValueError, TypeError):
-            pass
-
-    ok = bcrypt.checkpw(password.encode(), pw_hash.encode())
-    if not ok:
-        new_count = (failed_count or 0) + 1
-        with _connect(db_path) as conn:
-            if new_count >= 5:
-                lock_until = (datetime.utcnow() + timedelta(minutes=30)).isoformat()
-                _execute(
-                    conn,
-                    "UPDATE users SET failed_login_count = ?, locked_until = ? WHERE email = ?",
-                    (new_count, lock_until, email),
-                )
-            else:
-                _execute(
-                    conn, "UPDATE users SET failed_login_count = ? WHERE email = ?",
-                    (new_count, email),
-                )
-        return False, ""
-
-    with _connect(db_path) as conn:
-        _execute(
-            conn,
-            "UPDATE users SET failed_login_count = 0, locked_until = NULL WHERE email = ?",
-            (email,),
-        )
-    return True, role
-
-
-def _audit_log(
-    email: str, action: str, details: str = "", db_path: Path = DB_PATH,
-) -> None:
-    init_db(db_path)
-    log_id = uuid.uuid4().hex
-    with _connect(db_path) as conn:
-        _execute(
-            conn,
-            "INSERT INTO auth_audit_log (id, email, action, details) VALUES (?, ?, ?, ?)",
-            (log_id, email, action, details),
-        )
-
-
-def create_auth_session(
-    email: str, role: str, max_age_days: int = 7, db_path: Path = DB_PATH,
-) -> str:
-    init_db(db_path)
-    session_id = uuid.uuid4().hex
-    expires_at = (datetime.utcnow() + timedelta(days=max_age_days)).isoformat()
-    with _connect(db_path) as conn:
-        _execute(
-            conn,
-            "INSERT INTO auth_sessions (session_id, email, role, expires_at) VALUES (?, ?, ?, ?)",
-            (session_id, email, role, expires_at),
-        )
-    _audit_log(email, "session_created", f"sid={session_id[:12]}...", db_path)
-    return session_id
-
-
-def validate_session(
-    session_id: str, db_path: Path = DB_PATH,
-) -> tuple[bool, str, str]:
-    if not session_id:
-        return False, "", ""
-    init_db(db_path)
-    with _connect(db_path) as conn:
-        row = _execute(
-            conn,
-            "SELECT email, role, expires_at, is_revoked FROM auth_sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-    if row is None:
-        return False, "", ""
-    email, role, expires_at, is_revoked = row
-    if is_revoked:
-        return False, "", ""
-    try:
-        expires = datetime.fromisoformat(expires_at)
-        if datetime.utcnow() > expires:
-            return False, "", ""
-    except (ValueError, TypeError):
-        pass
-    with _connect(db_path) as conn:
-        _execute(
-            conn,
-            "UPDATE auth_sessions SET last_activity = CURRENT_TIMESTAMP WHERE session_id = ?",
-            (session_id,),
-        )
-    return True, email, role
-
-
-def revoke_session(session_id: str, db_path: Path = DB_PATH) -> None:
-    init_db(db_path)
-    with _connect(db_path) as conn:
-        _execute(
-            conn, "UPDATE auth_sessions SET is_revoked = 1 WHERE session_id = ?",
-            (session_id,),
-        )
-        row = _execute(
-            conn, "SELECT email FROM auth_sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-    if row:
-        _audit_log(row[0], "session_revoked", f"sid={session_id[:12]}...", db_path)
-
-
-def revoke_all_user_sessions(email: str, db_path: Path = DB_PATH) -> int:
-    init_db(db_path)
-    with _connect(db_path) as conn:
-        result = _execute(
-            conn, "UPDATE auth_sessions SET is_revoked = 1 WHERE email = ? AND is_revoked = 0",
-            (email,),
-        )
-        count = result.rowcount if hasattr(result, "rowcount") else 0
-    if count:
-        _audit_log(email, "all_sessions_revoked", f"{count} sessions", db_path)
-    return count
-
-
-def get_user_by_email(email: str, db_path: Path = DB_PATH) -> dict | None:
-    init_db(db_path)
-    with _connect(db_path) as conn:
-        row = _execute(
-            conn,
-            "SELECT email, role, display_name, is_active FROM users WHERE email = ?",
-            (email,),
-        ).fetchone()
-    if row is None:
-        return None
-    return {
-        "email": row[0],
-        "role": row[1],
-        "display_name": row[2] or "",
-        "is_active": bool(row[3]),
-    }
-
-
-def list_users(db_path: Path = DB_PATH) -> list[dict]:
-    init_db(db_path)
-    keys = ["email", "role", "display_name", "is_active", "failed_login_count", "locked_until"]
-    with _connect(db_path) as conn:
-        rows = _execute(
-            conn,
-            "SELECT email, role, display_name, is_active, failed_login_count, locked_until FROM users ORDER BY email",
-        ).fetchall()
-    return [dict(zip(keys, row)) for row in rows]
-
-
-def update_user_password(email: str, new_password: str, db_path: Path = DB_PATH) -> bool:
-    import bcrypt
-    init_db(db_path)
-    pw_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
-    with _connect(db_path) as conn:
-        try:
-            _execute(
-                conn,
-                "UPDATE users SET password_hash = ?, password_changed_at = CURRENT_TIMESTAMP WHERE email = ?",
-                (pw_hash, email),
-            )
-            _audit_log(email, "password_changed", db_path=db_path)
-            return True
-        except Exception:
-            return False
-
-
-def update_user_role(email: str, new_role: str, db_path: Path = DB_PATH) -> bool:
-    init_db(db_path)
-    with _connect(db_path) as conn:
-        try:
-            _execute(conn, "UPDATE users SET role = ? WHERE email = ?", (new_role, email))
-            _audit_log(email, "role_changed", new_role, db_path)
-            return True
-        except Exception:
-            return False
-
-
-def clean_expired_sessions(db_path: Path = DB_PATH) -> int:
-    try:
-        with _connect(db_path) as conn:
-            if _is_pg():
-                sql = "DELETE FROM auth_sessions WHERE expires_at < NOW()"
-            else:
-                sql = "DELETE FROM auth_sessions WHERE expires_at < datetime('now')"
-            result = _execute(conn, sql)
-            return result.rowcount if hasattr(result, "rowcount") else 0
-    except Exception:
-        return 0

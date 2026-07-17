@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import sys
-import time
 from datetime import datetime
 from typing import Any
 
@@ -199,27 +198,20 @@ import streamlit as st
 
 from crm_parser import DEFAULT_STATUS_MAPPING, parse_crm_bundle
 from database import (
-    create_auth_session,
+    PUBLIC_ACTOR,
     database_stats,
     delete_all_data,
     delete_logs,
-    get_user_by_email,
     init_db,
-    list_users,
     load_customer_bundle,
     load_customer_url,
     load_financial_events,
     load_inventory,
     load_logs,
     load_mentions,
-    register_user,
-    revoke_session,
     save_parse_result,
     SaveResult,
-    seed_admin,
     validate_db_config,
-    validate_session,
-    verify_user,
     _get_db_url,
     _is_production,
     _is_pg,
@@ -278,131 +270,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── Session / idle check ──
-st.markdown(
-    """
-    <script>
-    const p = new URLSearchParams(window.location.search);
-    if (!p.has('_sess')) {
-        const s = sessionStorage.getItem('gf_sess');
-        if (s) {
-            window.history.replaceState({}, '', '?_sess=' + s + window.location.hash);
-        } else {
-            const t = Date.now().toString();
-            sessionStorage.setItem('gf_sess', t);
-            window.history.replaceState({}, '', '?_sess=' + t + window.location.hash);
-        }
-    }
-    if (!p.has('_gf_token')) {
-        const t = localStorage.getItem('gf_token');
-        if (t) {
-            p.set('_gf_token', t);
-            window.history.replaceState({}, '', '?' + p.toString() + window.location.hash);
-            location.reload();
-        }
-    }
-    </script>
-    """,
-    unsafe_allow_html=True,
-)
-_sess = st.query_params.get("_sess", [""])[0]
-if _sess == "NEW" and st.session_state.get("authenticated"):
-    st.session_state.authenticated = False
-    st.rerun()
-
-# ── Auth restore from persistent token ──
-if "authenticated" not in st.session_state:
-    _gf_token = st.query_params.get("_gf_token", [""])[0]
-    if _gf_token:
-        valid, email, role = validate_session(_gf_token)
-        if valid:
-            user = get_user_by_email(email)
-            if user and user.get("is_active"):
-                st.session_state.authenticated = True
-                st.session_state.user_email = email
-                st.session_state.user_role = role
-                st.session_state.auth_session_id = _gf_token
-                st.session_state.last_activity = time.time()
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-
-elif st.session_state.get("authenticated"):
-    now = time.time()
-    last = st.session_state.get("last_activity", now)
-    idle = now - last
-    if idle > 60:
-        st.warning("⚠️ Phiên đăng nhập hết hạn do không hoạt động quá 60 phút.")
-        st.session_state.authenticated = False
-        st.rerun()
-    elif idle > 10:
-        st.toast("⚠️ Bạn sắp bị đăng xuất do không hoạt động quá 10 phút.")
-    st.session_state.last_activity = now
-
-# ── Auth UI ──
-if not st.session_state.authenticated:
-    st.title("🔐 Đăng nhập")
-    login_tab, register_tab = st.tabs(["Đăng nhập", "Đăng ký"])
-
-    with login_tab:
-        with st.form("login_form"):
-            login_email = st.text_input(
-                "Email (@driphydration.vn)",
-                placeholder="username@driphydration.vn",
-            ).strip().lower()
-            login_pw = st.text_input("Password", type="password")
-            if st.form_submit_button("Đăng nhập", type="primary", use_container_width=True):
-                if not login_email.endswith("@driphydration.vn"):
-                    st.error("Email phải có đuôi @driphydration.vn")
-                else:
-                    ok, role = verify_user(login_email, login_pw)
-                    if ok:
-                        session_id = create_auth_session(login_email, role)
-                        st.session_state.auth_session_id = session_id
-                        st.session_state.authenticated = True
-                        st.session_state.user_email = login_email
-                        st.session_state.user_role = role
-                        st.markdown(
-                            f"<script>localStorage.setItem('gf_token', '{session_id}');</script>",
-                            unsafe_allow_html=True,
-                        )
-                        st.rerun()
-                    else:
-                        st.error("Sai email hoặc mật khẩu hoặc tài khoản bị khoá")
-
-    with register_tab:
-        with st.form("register_form"):
-            reg_email = st.text_input(
-                "Email (@driphydration.vn)",
-                placeholder="username@driphydration.vn",
-            ).strip().lower()
-            reg_pw = st.text_input("Password", type="password")
-            reg_confirm = st.text_input("Xác nhận password", type="password")
-            if st.form_submit_button("Đăng ký", use_container_width=True):
-                if not reg_email.endswith("@driphydration.vn"):
-                    st.error("Email phải có đuôi @driphydration.vn")
-                elif len(reg_pw) < 4:
-                    st.error("Password phải có ít nhất 4 ký tự")
-                elif reg_pw != reg_confirm:
-                    st.error("Mật khẩu xác nhận không khớp")
-                elif register_user(reg_email, reg_pw):
-                    st.success("Đăng ký thành công! Chuyển sang tab Đăng nhập.")
-                else:
-                    st.error("Email này đã tồn tại")
-
-    st.stop()
-
-role_badge = "🛡️ admin" if st.session_state.user_role == "admin" else "👤 user"
-st.sidebar.markdown(f"👤 **{st.session_state.user_email}** · {role_badge}")
-if st.sidebar.button("🚪 Đăng xuất"):
-    if st.session_state.get("auth_session_id"):
-        revoke_session(st.session_state.auth_session_id)
-    st.markdown(
-        "<script>localStorage.removeItem('gf_token');</script>",
-        unsafe_allow_html=True,
-    )
-    st.session_state.authenticated = False
-    st.rerun()
-
 init_db()
 
 if _is_production() and not _get_db_url():
@@ -413,6 +280,11 @@ if _is_production() and not _get_db_url():
         "Dữ liệu sẽ KHÔNG được lưu khi thiếu cấu hình này.",
         icon="🚨",
     )
+
+st.sidebar.info(
+    "Ứng dụng đang ở chế độ truy cập công khai. "
+    "Dữ liệu lưu trong hệ thống được dùng chung cho tất cả người truy cập."
+)
 
 st.session_state.setdefault("crm_bundle", None)
 st.session_state.setdefault("raw_text", "")
@@ -470,7 +342,6 @@ def _show_db_diagnostics() -> None:
     st.markdown(f"**CRM Logs:** {l}")
     st.markdown(f"**Financial Events:** {f}")
     st.markdown(f"**Service Inventory:** {i}")
-    st.markdown(f"**Auth Users:** {len(list_users())}")
 
 
 def latest_balance(financial: pd.DataFrame, event_type: str) -> float | None:
@@ -755,9 +626,8 @@ with st.sidebar:
     st.metric("Sự kiện tài chính", f"{financial_count:,}")
     st.metric("Dòng tồn dịch vụ", f"{inventory_count:,}")
 
-    if st.session_state.get("user_role") == "admin":
-        with st.expander("🛠️ Database Diagnostics", expanded=False):
-            _show_db_diagnostics()
+    with st.expander("🛠️ Database Diagnostics", expanded=False):
+        _show_db_diagnostics()
 
 
 tab_parse, tab_history, tab_guide = st.tabs(
@@ -987,8 +857,7 @@ with tab_parse:
                 st.caption("🔒 Cần cấu hình DATABASE_URL")
             if save_btn:
                 try:
-                    user_email = st.session_state.get("user_email", "")
-                    save_result = save_parse_result(bundle, metadata, created_by=user_email)
+                    save_result = save_parse_result(bundle, metadata, created_by=PUBLIC_ACTOR)
                     if save_result.committed:
                         # load-after-save validation
                         persisted = load_customer_bundle(metadata["customer_code"])
@@ -1042,52 +911,26 @@ with tab_history:
     ]
 
     st.markdown("---")
-    is_admin = st.session_state.get("user_role") == "admin"
-    col_delete_sel, col_delete_all, _ = st.columns([1, 1, 2])
+    col_delete_sel, _ = st.columns([1, 3])
     with col_delete_sel:
         if st.button("Xoá dòng đã chọn", type="secondary", use_container_width=True):
-            if not is_admin:
-                st.warning("Bạn không có quyền xoá dữ liệu.")
-            else:
-                selected_by_tab = st.session_state.get("history_checked_rows", {})
-                all_keys = []
-                for tab_idx, frame in enumerate(history_frames):
-                    tab_selected = selected_by_tab.get(tab_idx, set())
-                    if tab_selected and not frame.empty:
-                        id_col = ["Log key", "Log key", "Log key", "Log key"][tab_idx]
-                        if id_col in frame.columns:
-                            for row_idx in tab_selected:
-                                if row_idx < len(frame):
-                                    all_keys.append(str(frame.iloc[row_idx].get(id_col, "")))
-                deleted = delete_logs([k for k in all_keys if k])
-                if deleted:
-                    st.success(f"Đã xoá {deleted} log và dữ liệu liên quan.")
-                    st.session_state["history_refresh"] = refresh_key + 1
-                    st.rerun()
-                else:
-                    st.warning("Không có dòng nào được chọn hoặc log key không hợp lệ.")
-    with col_delete_all:
-        if st.button("Xoá toàn bộ database", type="secondary", use_container_width=True):
-            if not is_admin:
-                st.warning("Bạn không có quyền xoá dữ liệu.")
-            else:
-                st.session_state["confirm_delete_all"] = True
-
-    if st.session_state.get("confirm_delete_all"):
-        st.warning("Bạn có chắc chắn muốn xoá TOÀN BỘ dữ liệu? Hành động này không thể hoàn tác.")
-        c_confirm, c_cancel = st.columns([1, 1])
-        with c_confirm:
-            if st.button("Xác nhận xoá tất cả", type="primary", use_container_width=True):
-                counts = delete_all_data()
-                total = sum(counts.values())
-                st.success(f"Đã xoá {total} dòng khỏi database.")
-                st.session_state["confirm_delete_all"] = False
+            selected_by_tab = st.session_state.get("history_checked_rows", {})
+            all_keys = []
+            for tab_idx, frame in enumerate(history_frames):
+                tab_selected = selected_by_tab.get(tab_idx, set())
+                if tab_selected and not frame.empty:
+                    id_col = ["Log key", "Log key", "Log key", "Log key"][tab_idx]
+                    if id_col in frame.columns:
+                        for row_idx in tab_selected:
+                            if row_idx < len(frame):
+                                all_keys.append(str(frame.iloc[row_idx].get(id_col, "")))
+            deleted = delete_logs([k for k in all_keys if k])
+            if deleted:
+                st.success(f"Đã xoá {deleted} log và dữ liệu liên quan.")
                 st.session_state["history_refresh"] = refresh_key + 1
                 st.rerun()
-        with c_cancel:
-            if st.button("Huỷ", use_container_width=True):
-                st.session_state["confirm_delete_all"] = False
-                st.rerun()
+            else:
+                st.warning("Không có dòng nào được chọn hoặc log key không hợp lệ.")
 
     # Load Getfly URL if searching a specific customer
     customer_url = load_customer_url(search_code) if search_code else ""
